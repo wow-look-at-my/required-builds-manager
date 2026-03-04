@@ -1,8 +1,32 @@
-import { listStatuses } from "./github";
+import { listStatuses, listCheckRuns } from "./github";
 
 export interface AggregateResult {
 	state: "success" | "pending" | "failure" | "error";
 	description: string;
+}
+
+type SimpleState = "success" | "pending" | "failure";
+
+function mapCheckRunState(status: string, conclusion: string | null): SimpleState {
+	if (status === "queued" || status === "in_progress") return "pending";
+	if (status !== "completed") return "pending";
+
+	// completed — map by conclusion
+	switch (conclusion) {
+		case "success":
+		case "neutral":
+		case "skipped":
+			return "success";
+		case "failure":
+		case "timed_out":
+		case "cancelled":
+		case "action_required":
+			return "failure";
+		case "stale":
+			return "pending";
+		default:
+			return "pending";
+	}
 }
 
 export async function computeAllBuildsState(
@@ -17,27 +41,39 @@ export async function computeAllBuildsState(
 		return { state: "failure", description: "One or more builds failed" };
 	}
 
-	// Fetch all statuses for this SHA
+	// Fetch both statuses and check runs
 	let statuses;
+	let checkRuns;
 	try {
-		statuses = await listStatuses(token, owner, repo, sha);
+		[statuses, checkRuns] = await Promise.all([
+			listStatuses(token, owner, repo, sha),
+			listCheckRuns(token, owner, repo, sha),
+		]);
 	} catch {
 		return { state: "error", description: "Failed to fetch commit statuses" };
 	}
 
-	// Deduplicate by context — statuses come newest-first from the API,
-	// so the first occurrence of each context is the latest
-	const seen = new Set<string>();
-	const deduped: { state: string; context: string }[] = [];
+	// Deduplicate statuses by context — newest first from API
+	const seenContexts = new Set<string>();
+	const entries: { state: SimpleState }[] = [];
 	for (const s of statuses) {
 		if (s.context === "all-builds") continue;
-		if (seen.has(s.context)) continue;
-		seen.add(s.context);
-		deduped.push(s);
+		if (seenContexts.has(s.context)) continue;
+		seenContexts.add(s.context);
+		entries.push({ state: s.state as SimpleState });
 	}
 
-	// No other statuses — just this one incoming
-	if (deduped.length === 0) {
+	// Deduplicate check runs by name — take first occurrence
+	const seenNames = new Set<string>();
+	for (const cr of checkRuns) {
+		if (cr.name === "all-builds") continue;
+		if (seenNames.has(cr.name)) continue;
+		seenNames.add(cr.name);
+		entries.push({ state: mapCheckRunState(cr.status, cr.conclusion) });
+	}
+
+	// No other entries — just the incoming event
+	if (entries.length === 0) {
 		if (incomingState === "success") {
 			return { state: "success", description: "All builds passed" };
 		}
@@ -48,12 +84,12 @@ export async function computeAllBuildsState(
 	let hasFailure = false;
 	let hasPending = false;
 
-	for (const s of deduped) {
-		if (s.state === "failure" || s.state === "error") {
+	for (const e of entries) {
+		if (e.state === "failure" || e.state === "error") {
 			hasFailure = true;
 			break;
 		}
-		if (s.state === "pending") {
+		if (e.state === "pending") {
 			hasPending = true;
 		}
 	}

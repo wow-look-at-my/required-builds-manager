@@ -43,10 +43,38 @@ function makeRequest(
 	});
 }
 
+function makeCheckRunRequest(
+	body: object,
+	headers: Record<string, string> = {},
+): Request {
+	return new Request("https://worker.example.com/webhook", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"x-github-event": "check_run",
+			"x-hub-signature-256": "sha256=abc123",
+			...headers,
+		},
+		body: JSON.stringify(body),
+	});
+}
+
 const statusPayload = {
 	state: "success",
 	context: "ci/tests",
 	sha: "abc123def",
+	repository: { full_name: "myorg/myrepo" },
+	installation: { id: 12345 },
+};
+
+const checkRunPayload = {
+	action: "completed",
+	check_run: {
+		name: "build",
+		status: "completed",
+		conclusion: "success",
+		head_sha: "abc123def",
+	},
 	repository: { full_name: "myorg/myrepo" },
 	installation: { id: 12345 },
 };
@@ -67,7 +95,7 @@ describe("worker fetch handler", () => {
 		expect(res.status).toBe(405);
 	});
 
-	it("ignores non-status events", async () => {
+	it("ignores non-status/check_run events", async () => {
 		const req = new Request("https://worker.example.com/webhook", {
 			method: "POST",
 			headers: { "x-github-event": "push" },
@@ -150,5 +178,169 @@ describe("worker fetch handler", () => {
 
 		expect(res.status).toBe(500);
 		expect(await res.text()).toBe("Failed to authenticate: JWT signing failed");
+	});
+
+	// check_run event tests
+
+	it("processes a completed successful check_run", async () => {
+		const req = makeCheckRunRequest(checkRunPayload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"success",
+		);
+	});
+
+	it("maps check_run in_progress to pending", async () => {
+		const payload = {
+			...checkRunPayload,
+			check_run: { ...checkRunPayload.check_run, status: "in_progress", conclusion: null },
+		};
+		const req = makeCheckRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"pending",
+		);
+	});
+
+	it("maps check_run queued to pending", async () => {
+		const payload = {
+			...checkRunPayload,
+			check_run: { ...checkRunPayload.check_run, status: "queued", conclusion: null },
+		};
+		const req = makeCheckRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"pending",
+		);
+	});
+
+	it("maps check_run failure conclusion to failure", async () => {
+		const payload = {
+			...checkRunPayload,
+			check_run: { ...checkRunPayload.check_run, status: "completed", conclusion: "failure" },
+		};
+		const req = makeCheckRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"failure",
+		);
+	});
+
+	it("maps check_run timed_out conclusion to failure", async () => {
+		const payload = {
+			...checkRunPayload,
+			check_run: { ...checkRunPayload.check_run, status: "completed", conclusion: "timed_out" },
+		};
+		const req = makeCheckRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"failure",
+		);
+	});
+
+	it("maps check_run neutral conclusion to success", async () => {
+		const payload = {
+			...checkRunPayload,
+			check_run: { ...checkRunPayload.check_run, status: "completed", conclusion: "neutral" },
+		};
+		const req = makeCheckRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"success",
+		);
+	});
+
+	it("maps check_run skipped conclusion to success", async () => {
+		const payload = {
+			...checkRunPayload,
+			check_run: { ...checkRunPayload.check_run, status: "completed", conclusion: "skipped" },
+		};
+		const req = makeCheckRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"success",
+		);
+	});
+
+	it("maps check_run stale conclusion to pending", async () => {
+		const payload = {
+			...checkRunPayload,
+			check_run: { ...checkRunPayload.check_run, status: "completed", conclusion: "stale" },
+		};
+		const req = makeCheckRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"pending",
+		);
+	});
+
+	it("ignores all-builds check run name", async () => {
+		const payload = {
+			...checkRunPayload,
+			check_run: { ...checkRunPayload.check_run, name: "all-builds" },
+		};
+		const req = makeCheckRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe("Ignored all-builds check run");
+		expect(mockedCompute).not.toHaveBeenCalled();
+	});
+
+	it("returns 400 for check_run with missing installation ID", async () => {
+		const { installation: _, ...payloadNoInstall } = checkRunPayload;
+		const req = makeCheckRunRequest(payloadNoInstall);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(400);
+		expect(await res.text()).toBe("Missing installation ID in webhook payload");
 	});
 });
