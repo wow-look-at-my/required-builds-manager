@@ -1,9 +1,11 @@
 import { verifySignature } from "./verify";
 import { computeAllBuildsState } from "./aggregate";
 import { createStatus } from "./github";
+import { getInstallationToken } from "./auth";
 
 interface Env {
-	GITHUB_TOKEN: string;
+	GITHUB_APP_ID: string;
+	GITHUB_APP_PRIVATE_KEY: string;
 	WEBHOOK_SECRET: string;
 }
 
@@ -13,6 +15,9 @@ interface StatusEvent {
 	sha: string;
 	repository: {
 		full_name: string;
+	};
+	installation?: {
+		id: number;
 	};
 }
 
@@ -50,14 +55,26 @@ export default {
 			return new Response("Ignored all-builds context", { status: 200 });
 		}
 
-		if (!env.GITHUB_TOKEN) {
-			return new Response("Server misconfigured: missing GITHUB_TOKEN", { status: 500 });
+		if (!payload.installation?.id) {
+			return new Response("Missing installation ID in webhook payload", { status: 400 });
+		}
+
+		if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY) {
+			return new Response("Server misconfigured: missing GitHub App credentials", { status: 500 });
+		}
+
+		let token: string;
+		try {
+			token = await getInstallationToken(env, payload.installation.id);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : "Unknown error";
+			return new Response(`Failed to authenticate: ${msg}`, { status: 500 });
 		}
 
 		const [owner, repo] = payload.repository.full_name.split("/");
 
 		const result = await computeAllBuildsState(
-			env.GITHUB_TOKEN,
+			token,
 			owner,
 			repo,
 			payload.sha,
@@ -65,7 +82,7 @@ export default {
 		);
 
 		await createStatus(
-			env.GITHUB_TOKEN,
+			token,
 			owner,
 			repo,
 			payload.sha,

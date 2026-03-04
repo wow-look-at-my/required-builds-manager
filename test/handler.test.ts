@@ -4,6 +4,7 @@ import worker from "../src/index";
 import * as verify from "../src/verify";
 import * as aggregate from "../src/aggregate";
 import * as github from "../src/github";
+import * as auth from "../src/auth";
 
 vi.mock("../src/verify", () => ({
 	verifySignature: vi.fn(),
@@ -17,9 +18,14 @@ vi.mock("../src/github", () => ({
 	createStatus: vi.fn(),
 }));
 
+vi.mock("../src/auth", () => ({
+	getInstallationToken: vi.fn(),
+}));
+
 const mockedVerify = vi.mocked(verify.verifySignature);
 const mockedCompute = vi.mocked(aggregate.computeAllBuildsState);
 const mockedCreateStatus = vi.mocked(github.createStatus);
+const mockedGetToken = vi.mocked(auth.getInstallationToken);
 
 function makeRequest(
 	body: object,
@@ -42,6 +48,7 @@ const statusPayload = {
 	context: "ci/tests",
 	sha: "abc123def",
 	repository: { full_name: "myorg/myrepo" },
+	installation: { id: 12345 },
 };
 
 describe("worker fetch handler", () => {
@@ -50,6 +57,7 @@ describe("worker fetch handler", () => {
 		mockedVerify.mockResolvedValue(true);
 		mockedCompute.mockResolvedValue({ state: "success", description: "All builds passed" });
 		mockedCreateStatus.mockResolvedValue(undefined);
+		mockedGetToken.mockResolvedValue("test-installation-token");
 	});
 
 	it("rejects non-POST methods", async () => {
@@ -99,20 +107,33 @@ describe("worker fetch handler", () => {
 		expect(mockedCompute).not.toHaveBeenCalled();
 	});
 
+	it("returns 400 for missing installation ID", async () => {
+		const { installation: _, ...payloadNoInstall } = statusPayload;
+		const req = makeRequest(payloadNoInstall);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(400);
+		expect(await res.text()).toBe("Missing installation ID in webhook payload");
+	});
+
 	it("processes a valid status event", async () => {
 		const req = makeRequest(statusPayload);
 		const res = await worker.fetch(req, env as any);
 
 		expect(res.status).toBe(200);
+		expect(mockedGetToken).toHaveBeenCalledWith(
+			expect.objectContaining({ GITHUB_APP_ID: "12345" }),
+			12345,
+		);
 		expect(mockedCompute).toHaveBeenCalledWith(
-			expect.any(String),
+			"test-installation-token",
 			"myorg",
 			"myrepo",
 			"abc123def",
 			"success",
 		);
 		expect(mockedCreateStatus).toHaveBeenCalledWith(
-			expect.any(String),
+			"test-installation-token",
 			"myorg",
 			"myrepo",
 			"abc123def",
@@ -120,5 +141,14 @@ describe("worker fetch handler", () => {
 			"all-builds",
 			"All builds passed",
 		);
+	});
+
+	it("returns 500 when token fetch fails", async () => {
+		mockedGetToken.mockRejectedValue(new Error("JWT signing failed"));
+		const req = makeRequest(statusPayload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(500);
+		expect(await res.text()).toBe("Failed to authenticate: JWT signing failed");
 	});
 });
