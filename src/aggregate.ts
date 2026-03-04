@@ -55,12 +55,12 @@ export async function computeAllBuildsState(
 
 	// Deduplicate statuses by context — newest first from API
 	const seenContexts = new Set<string>();
-	const entries: { state: SimpleState }[] = [];
+	const entries: { state: string }[] = [];
 	for (const s of statuses) {
 		if (s.context === "all-builds") continue;
 		if (seenContexts.has(s.context)) continue;
 		seenContexts.add(s.context);
-		entries.push({ state: s.state as SimpleState });
+		entries.push({ state: s.state });
 	}
 
 	// Deduplicate check runs by name — take first occurrence
