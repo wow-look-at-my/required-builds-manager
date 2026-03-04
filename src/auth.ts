@@ -131,7 +131,7 @@ function pkcs1ToPkcs8(pkcs1: Uint8Array): ArrayBuffer {
 	content.set(algorithmId, 0);
 	content.set(octetString, algorithmId.length);
 
-	return derEncode(0x30, content).buffer;
+	return derEncode(0x30, content).buffer as ArrayBuffer;
 }
 
 function derEncode(tag: number, content: Uint8Array): Uint8Array {
