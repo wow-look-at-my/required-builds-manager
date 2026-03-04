@@ -125,6 +125,10 @@ function pemToDer(pem: string): ArrayBuffer {
 }
 
 function pkcs1ToPkcs8(pkcs1: Uint8Array): ArrayBuffer {
+	// PKCS#8 PrivateKeyInfo: SEQUENCE { INTEGER 0, AlgorithmIdentifier, OCTET STRING }
+	// Version: INTEGER 0
+	const version = new Uint8Array([0x02, 0x01, 0x00]);
+
 	// AlgorithmIdentifier for RSA: SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }
 	const algorithmId = new Uint8Array([
 		0x30, 0x0d,
@@ -134,9 +138,10 @@ function pkcs1ToPkcs8(pkcs1: Uint8Array): ArrayBuffer {
 
 	const octetString = derEncode(0x04, pkcs1);
 
-	const content = new Uint8Array(algorithmId.length + octetString.length);
-	content.set(algorithmId, 0);
-	content.set(octetString, algorithmId.length);
+	const content = new Uint8Array(version.length + algorithmId.length + octetString.length);
+	content.set(version, 0);
+	content.set(algorithmId, version.length);
+	content.set(octetString, version.length + algorithmId.length);
 
 	return derEncode(0x30, content).buffer as ArrayBuffer;
 }
