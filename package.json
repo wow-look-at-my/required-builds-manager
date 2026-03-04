@@ -1,0 +1,16 @@
+{
+	"name": "required-builds-manager",
+	"version": "1.0.0",
+	"private": true,
+	"scripts": {
+		"test": "vitest run",
+		"dev": "wrangler dev"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.8",
+		"@cloudflare/workers-types": "^4",
+		"typescript": "^5",
+		"vitest": "^3",
+		"wrangler": "^4"
+	}
+}

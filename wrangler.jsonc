@@ -1,0 +1,5 @@
+{
+	"name": "required-builds-manager",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-01-01"
+}

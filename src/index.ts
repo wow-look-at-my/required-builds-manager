@@ -1,0 +1,82 @@
+import { verifySignature } from "./verify";
+import { computeAllBuildsState } from "./aggregate";
+import { createStatus } from "./github";
+
+interface Env {
+	GITHUB_TOKEN: string;
+	WEBHOOK_SECRET: string;
+}
+
+interface StatusEvent {
+	state: string;
+	context: string;
+	sha: string;
+	repository: {
+		full_name: string;
+	};
+}
+
+export default {
+	async fetch(request: Request, env: Env): Promise<Response> {
+		if (request.method !== "POST") {
+			return new Response("Method not allowed", { status: 405 });
+		}
+
+		const event = request.headers.get("x-github-event");
+		if (event !== "status") {
+			return new Response("Ignored event", { status: 200 });
+		}
+
+		const body = await request.text();
+
+		const signature = request.headers.get("x-hub-signature-256");
+		if (!signature) {
+			return new Response("Missing signature", { status: 401 });
+		}
+
+		if (!env.WEBHOOK_SECRET) {
+			return new Response("Server misconfigured: missing WEBHOOK_SECRET", { status: 500 });
+		}
+
+		const valid = await verifySignature(env.WEBHOOK_SECRET, body, signature);
+		if (!valid) {
+			return new Response("Invalid signature", { status: 401 });
+		}
+
+		const payload: StatusEvent = JSON.parse(body);
+
+		// Prevent infinite loop
+		if (payload.context === "all-builds") {
+			return new Response("Ignored all-builds context", { status: 200 });
+		}
+
+		if (!env.GITHUB_TOKEN) {
+			return new Response("Server misconfigured: missing GITHUB_TOKEN", { status: 500 });
+		}
+
+		const [owner, repo] = payload.repository.full_name.split("/");
+
+		const result = await computeAllBuildsState(
+			env.GITHUB_TOKEN,
+			owner,
+			repo,
+			payload.sha,
+			payload.state,
+		);
+
+		await createStatus(
+			env.GITHUB_TOKEN,
+			owner,
+			repo,
+			payload.sha,
+			result.state,
+			"all-builds",
+			result.description,
+		);
+
+		return new Response(JSON.stringify(result), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	},
+};
