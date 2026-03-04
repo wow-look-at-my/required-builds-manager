@@ -4,6 +4,12 @@ export interface CommitStatus {
 	id: number;
 }
 
+export interface CheckRun {
+	name: string;
+	status: string;
+	conclusion: string | null;
+}
+
 const GITHUB_API = "https://api.github.com";
 
 export async function listStatuses(
@@ -34,6 +40,40 @@ export async function listStatuses(
 
 		all.push(...statuses);
 		if (statuses.length < 100) break;
+		page++;
+	}
+
+	return all;
+}
+
+export async function listCheckRuns(
+	token: string,
+	owner: string,
+	repo: string,
+	sha: string,
+): Promise<CheckRun[]> {
+	const all: CheckRun[] = [];
+	let page = 1;
+
+	for (;;) {
+		const url = `${GITHUB_API}/repos/${owner}/${repo}/commits/${sha}/check-runs?per_page=100&page=${page}`;
+		const res = await fetch(url, {
+			headers: {
+				Authorization: `token ${token}`,
+				Accept: "application/vnd.github+json",
+				"User-Agent": "required-builds-manager",
+			},
+		});
+
+		if (!res.ok) {
+			throw new Error(`GitHub API error: ${res.status} ${res.statusText}`);
+		}
+
+		const data: { check_runs: CheckRun[] } = await res.json();
+		if (data.check_runs.length === 0) break;
+
+		all.push(...data.check_runs);
+		if (data.check_runs.length < 100) break;
 		page++;
 	}
 
