@@ -159,6 +159,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"success",
+			12345,
 		);
 		expect(mockedCreateStatus).toHaveBeenCalledWith(
 			"test-installation-token",
@@ -193,6 +194,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"success",
+			12345,
 		);
 	});
 
@@ -211,6 +213,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"pending",
+			12345,
 		);
 	});
 
@@ -229,6 +232,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"pending",
+			12345,
 		);
 	});
 
@@ -247,6 +251,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"failure",
+			12345,
 		);
 	});
 
@@ -265,6 +270,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"failure",
+			12345,
 		);
 	});
 
@@ -283,6 +289,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"success",
+			12345,
 		);
 	});
 
@@ -301,6 +308,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"success",
+			12345,
 		);
 	});
 
@@ -319,10 +327,11 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"pending",
+			12345,
 		);
 	});
 
-	it("ignores all-builds check run name", async () => {
+	it("processes check run named all-builds (not ignored)", async () => {
 		const payload = {
 			...checkRunPayload,
 			check_run: { ...checkRunPayload.check_run, name: "all-builds" },
@@ -331,8 +340,14 @@ describe("worker fetch handler", () => {
 		const res = await worker.fetch(req, env as any);
 
 		expect(res.status).toBe(200);
-		expect(await res.text()).toBe("Ignored all-builds check run");
-		expect(mockedCompute).not.toHaveBeenCalled();
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"success",
+			12345,
+		);
 	});
 
 	it("returns 400 for check_run with missing installation ID", async () => {

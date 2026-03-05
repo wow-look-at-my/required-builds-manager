@@ -222,15 +222,37 @@ describe("computeAllBuildsState", () => {
 		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
 	});
 
-	it("filters out all-builds check run name", async () => {
+	it("does not filter check runs by name — filters by app.id instead", async () => {
 		mockedListCheckRuns.mockResolvedValue([
-			{ name: "all-builds", status: "completed", conclusion: "success" },
+			{ name: "all-builds", status: "completed", conclusion: "failure" },
 			{ name: "build", status: "completed", conclusion: "success" },
 		]);
 
+		// Without appId, the all-builds check run is included and causes failure
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+	});
 
+	it("filters out check runs from our own app by app.id", async () => {
+		mockedListCheckRuns.mockResolvedValue([
+			{ name: "all-builds", status: "completed", conclusion: "failure", app: { id: 99999 } },
+			{ name: "build", status: "completed", conclusion: "success" },
+		]);
+
+		// With matching appId, the check run from our app is excluded
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", 99999);
 		expect(result).toEqual({ state: "success", description: "All builds passed" });
+	});
+
+	it("does not filter check runs from a different app", async () => {
+		mockedListCheckRuns.mockResolvedValue([
+			{ name: "all-builds", status: "completed", conclusion: "failure", app: { id: 11111 } },
+			{ name: "build", status: "completed", conclusion: "success" },
+		]);
+
+		// app.id doesn't match — check run is included
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", 99999);
+		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 	});
 
 	it("deduplicates check runs by name — first wins", async () => {
