@@ -35,6 +35,7 @@ export async function computeAllBuildsState(
 	repo: string,
 	sha: string,
 	incomingState: string,
+	appId?: number,
 ): Promise<AggregateResult> {
 	// Fast path: failure or error means immediate failure
 	if (incomingState === "failure" || incomingState === "error") {
@@ -64,9 +65,12 @@ export async function computeAllBuildsState(
 	}
 
 	// Deduplicate check runs by name — take first occurrence
+	// Filter out check runs created by our own app (identified by app.id)
+	// to prevent self-loops. Unlike statuses, we don't filter by name — that
+	// would let someone bypass the system by naming their check run "all-builds".
 	const seenNames = new Set<string>();
 	for (const cr of checkRuns) {
-		if (cr.name === "all-builds") continue;
+		if (appId != null && cr.app?.id === appId) continue;
 		if (seenNames.has(cr.name)) continue;
 		seenNames.add(cr.name);
 		entries.push({ state: mapCheckRunState(cr.status, cr.conclusion) });

@@ -8,6 +8,7 @@ export interface CheckRun {
 	name: string;
 	status: string;
 	conclusion: string | null;
+	app?: { id: number };
 }
 
 const GITHUB_API = "https://api.github.com";

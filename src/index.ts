@@ -104,12 +104,6 @@ export default {
 			installationId = payload.installation?.id;
 		} else {
 			const payload: CheckRunEvent = JSON.parse(body);
-
-			// Prevent infinite loop
-			if (payload.check_run.name === "all-builds") {
-				return new Response("Ignored all-builds check run", { status: 200 });
-			}
-
 			sha = payload.check_run.head_sha;
 			incomingState = mapCheckRunState(payload.check_run.status, payload.check_run.conclusion);
 			fullName = payload.repository.full_name;
@@ -140,6 +134,7 @@ export default {
 			repo,
 			sha,
 			incomingState,
+			parseInt(env.GITHUB_APP_ID),
 		);
 
 		await createStatus(
