@@ -22,12 +22,14 @@ src/
 ├── index.ts       # Worker entry point — POST webhook handler, event routing, check-run state mapping
 ├── aggregate.ts   # Low-water-mark aggregation: fetches all statuses + check-runs, deduplicates, computes combined state
 ├── auth.ts        # GitHub App JWT generation (RS256), installation token caching, PKCS#1/PKCS#8 key handling
+├── config.ts      # Per-repo YAML config loading from .github/required-builds.yml (with org .github repo fallback)
 ├── github.ts      # GitHub API client: listStatuses, listCheckRuns, createStatus (paginated)
 └── verify.ts      # HMAC-SHA256 webhook signature verification
 test/
 ├── handler.test.ts    # Handler integration tests
 ├── aggregate.test.ts  # Aggregation logic tests
 ├── auth.test.ts       # JWT and token caching tests
+├── config.test.ts     # Config parsing, glob matching, and fetching tests
 └── verify.test.ts     # Signature verification tests
 ```
 
@@ -38,7 +40,7 @@ test/
 - **Build/Deploy**: Wrangler 4
 - **Testing**: Vitest 3 with `@cloudflare/vitest-pool-workers` (runs tests inside the Workers runtime)
 - **Crypto**: Web Crypto API only — no external crypto libraries
-- **Dependencies**: Zero production dependencies; all devDependencies
+- **Dependencies**: Single production dependency (`yaml` for config parsing); rest are devDependencies
 
 ## Architecture
 
@@ -46,15 +48,18 @@ test/
 
 1. Receive POST from GitHub (`x-github-event: status` or `check_run`)
 2. Verify HMAC-SHA256 signature (`x-hub-signature-256` header)
-3. Parse event, extract SHA/state/repo — skip if context/name is "all-builds" (prevents infinite loops)
+3. Parse event, extract SHA/state/context/repo
 4. Authenticate as GitHub App: generate JWT → exchange for installation token (cached with 5-min threshold)
-5. Aggregate: if incoming state is failure/error, short-circuit. Otherwise fetch all statuses + check-runs for the SHA, deduplicate by context/name, compute low-water-mark
-6. POST the combined "all-builds" status back to GitHub
+5. Fetch per-repo config from `.github/required-builds.yml` (falls back to org `.github` repo, then defaults)
+6. Skip if context matches the configured status name (prevents infinite loops)
+7. Aggregate: if incoming state is failure/error (and not ignored), short-circuit. Otherwise fetch all statuses + check-runs for the SHA, deduplicate by context/name, filter out ignored patterns, compute low-water-mark
+8. POST the combined status back to GitHub using the configured context name
 
 ### Key Design Decisions
 
 - **Stateless**: No persistent storage — token cache is in-memory per Worker instance
-- **Infinite loop prevention**: Ignores events where context or check-run name is "all-builds"
+- **Per-repo config**: `.github/required-builds.yml` supports custom context name and ignore patterns (glob); falls back to org `.github` repo, then defaults
+- **Infinite loop prevention**: Ignores events where context matches the configured status name (default: "all-builds")
 - **Deduplication**: Statuses deduplicated by `context`, check-runs by `name` (API returns newest first)
 - **Check-run mapping**: `queued`/`in_progress` → pending; completed with `success`/`neutral`/`skipped` → success; `failure`/`timed_out`/`cancelled`/`action_required` → failure; `stale` → pending
 - **PKCS#1 support**: Manually wraps PKCS#1 RSA keys in PKCS#8 DER envelope for Web Crypto compatibility
@@ -79,7 +84,7 @@ npx vitest run test/aggregate.test.ts  # Run a single test file
 ```
 
 **Testing patterns used:**
-- `vi.mock()` for module mocking (e.g., `./github`, `./auth`, `./verify`)
+- `vi.mock()` for module mocking (e.g., `./github`, `./auth`, `./verify`, `./config`)
 - `fetchMock` from `cloudflare:test` for HTTP request mocking
 - `beforeEach` resets mocks between tests
 - Tests cover happy paths, error cases, deduplication, and state transitions

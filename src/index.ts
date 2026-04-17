@@ -2,6 +2,7 @@ import { verifySignature } from "./verify";
 import { computeAllBuildsState } from "./aggregate";
 import { createStatus } from "./github";
 import { getInstallationToken } from "./auth";
+import { getRepoConfig } from "./config";
 
 interface Env {
 	GITHUB_APP_ID: string;
@@ -87,25 +88,22 @@ export default {
 
 		let sha: string;
 		let incomingState: string;
+		let incomingContext: string;
 		let fullName: string;
 		let installationId: number | undefined;
 
 		if (event === "status") {
 			const payload: StatusEvent = JSON.parse(body);
-
-			// Prevent infinite loop
-			if (payload.context === "all-builds") {
-				return new Response("Ignored all-builds context", { status: 200 });
-			}
-
 			sha = payload.sha;
 			incomingState = payload.state;
+			incomingContext = payload.context;
 			fullName = payload.repository.full_name;
 			installationId = payload.installation?.id;
 		} else {
 			const payload: CheckRunEvent = JSON.parse(body);
 			sha = payload.check_run.head_sha;
 			incomingState = mapCheckRunState(payload.check_run.status, payload.check_run.conclusion);
+			incomingContext = payload.check_run.name;
 			fullName = payload.repository.full_name;
 			installationId = payload.installation?.id;
 		}
@@ -128,13 +126,22 @@ export default {
 
 		const [owner, repo] = fullName.split("/");
 
+		const config = await getRepoConfig(token, owner, repo);
+
+		// Prevent infinite loop — skip events from our own status context
+		if (event === "status" && incomingContext === config.context) {
+			return new Response(`Ignored ${config.context} context`, { status: 200 });
+		}
+
 		const result = await computeAllBuildsState(
 			token,
 			owner,
 			repo,
 			sha,
 			incomingState,
+			incomingContext,
 			parseInt(env.GITHUB_APP_ID),
+			config,
 		);
 
 		await createStatus(
@@ -143,7 +150,7 @@ export default {
 			repo,
 			sha,
 			result.state,
-			"all-builds",
+			config.context,
 			result.description,
 		);
 
