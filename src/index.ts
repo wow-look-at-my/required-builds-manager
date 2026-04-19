@@ -116,6 +116,11 @@ export default {
 			return new Response("Server misconfigured: missing GitHub App credentials", { status: 500 });
 		}
 
+		const appId = parseInt(env.GITHUB_APP_ID, 10);
+		if (!Number.isInteger(appId) || isNaN(appId)) {
+			return new Response("Server misconfigured: GITHUB_APP_ID must be a valid integer", { status: 500 });
+		}
+
 		let token: string;
 		try {
 			token = await getInstallationToken(env, installationId);
@@ -140,7 +145,7 @@ export default {
 			sha,
 			incomingState,
 			incomingContext,
-			parseInt(env.GITHUB_APP_ID),
+			appId,
 			config,
 		);
 
