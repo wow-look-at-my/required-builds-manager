@@ -12,5 +12,8 @@
 		"typescript": "^5",
 		"vitest": "^3",
 		"wrangler": "^4"
+	},
+	"dependencies": {
+		"yaml": "^2.8.3"
 	}
 }

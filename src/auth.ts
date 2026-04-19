@@ -98,15 +98,12 @@ function pemToDer(pem: string): ArrayBuffer {
 		.replace(/\r\n/g, "\n")
 		.trim();
 
-	console.log(`PEM key format: starts with "${normalized.substring(0, 30)}...", length=${normalized.length}`);
-
 	if (normalized.includes("BEGIN PRIVATE KEY")) {
 		// PKCS#8 format — use directly
 		const b64 = normalized
 			.replace(/-----BEGIN PRIVATE KEY-----/, "")
 			.replace(/-----END PRIVATE KEY-----/, "")
 			.replace(/\s/g, "");
-		console.log(`PKCS#8 base64 length: ${b64.length}`);
 		return base64ToArrayBuffer(b64);
 	}
 
@@ -116,7 +113,6 @@ function pemToDer(pem: string): ArrayBuffer {
 			.replace(/-----BEGIN RSA PRIVATE KEY-----/, "")
 			.replace(/-----END RSA PRIVATE KEY-----/, "")
 			.replace(/\s/g, "");
-		console.log(`PKCS#1 base64 length: ${b64.length}`);
 		const pkcs1 = new Uint8Array(base64ToArrayBuffer(b64));
 		return pkcs1ToPkcs8(pkcs1);
 	}

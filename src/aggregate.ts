@@ -1,4 +1,5 @@
 import { listStatuses, listCheckRuns } from "./github";
+import { type RepoConfig, matchesIgnorePattern } from "./config";
 
 export interface AggregateResult {
 	state: "success" | "pending" | "failure" | "error";
@@ -35,10 +36,16 @@ export async function computeAllBuildsState(
 	repo: string,
 	sha: string,
 	incomingState: string,
+	incomingContext: string,
 	appId?: number,
+	config?: RepoConfig,
 ): Promise<AggregateResult> {
-	// Fast path: failure or error means immediate failure
-	if (incomingState === "failure" || incomingState === "error") {
+	const ignorePatterns = config?.ignore ?? [];
+	const contextName = config?.context ?? "all-builds";
+	const incomingIsIgnored = matchesIgnorePattern(incomingContext, ignorePatterns);
+
+	// Fast path: failure or error means immediate failure (unless the source is ignored)
+	if (!incomingIsIgnored && (incomingState === "failure" || incomingState === "error")) {
 		return { state: "failure", description: "One or more builds failed" };
 	}
 
@@ -58,8 +65,9 @@ export async function computeAllBuildsState(
 	const seenContexts = new Set<string>();
 	const entries: { state: string }[] = [];
 	for (const s of statuses) {
-		if (s.context === "all-builds") continue;
+		if (s.context === contextName) continue;
 		if (seenContexts.has(s.context)) continue;
+		if (matchesIgnorePattern(s.context, ignorePatterns)) continue;
 		seenContexts.add(s.context);
 		entries.push({ state: s.state });
 	}
@@ -72,13 +80,14 @@ export async function computeAllBuildsState(
 	for (const cr of checkRuns) {
 		if (appId != null && cr.app?.id === appId) continue;
 		if (seenNames.has(cr.name)) continue;
+		if (matchesIgnorePattern(cr.name, ignorePatterns)) continue;
 		seenNames.add(cr.name);
 		entries.push({ state: mapCheckRunState(cr.status, cr.conclusion) });
 	}
 
-	// No other entries — just the incoming event
+	// No other relevant entries
 	if (entries.length === 0) {
-		if (incomingState === "success") {
+		if (incomingIsIgnored || incomingState === "success") {
 			return { state: "success", description: "All builds passed" };
 		}
 		return { state: "pending", description: "Builds in progress" };
@@ -99,7 +108,7 @@ export async function computeAllBuildsState(
 	}
 
 	// Factor in the incoming state (it may not be reflected in the API yet)
-	if (incomingState === "pending") {
+	if (!incomingIsIgnored && incomingState === "pending") {
 		hasPending = true;
 	}
 
