@@ -11,12 +11,6 @@ npm run dev         # Start local dev server (wrangler dev)
 npx tsc --noEmit    # Type-check without emitting
 ```
 
-## Observability
-
-Traces and logs are exported to `https://otel.pazer.tube` via Cloudflare's native OTEL export (`wrangler.jsonc` → `observability` block). 100% sampling (`head_sampling_rate: 1`).
-
-Two CF destinations must exist: `otel-cloudflare-traces` (dataset: `opentelemetry-traces`, URL: `https://otel.pazer.tube/v1/traces`) and `otel-cloudflare-logs` (dataset: `opentelemetry-logs`, URL: `https://otel.pazer.tube/v1/logs`). See README for the curl commands to create them.
-
 ## Deployment
 
 **NEVER run `wrangler deploy`, `npx wrangler deploy`, or any manual deployment command.** All deployments are handled exclusively through the GitHub Actions CI/CD pipeline. There are no exceptions.
