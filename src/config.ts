@@ -35,7 +35,7 @@ export function parseConfig(raw: string): RepoConfig {
 
 export function matchesIgnorePattern(name: string, patterns: string[]): boolean {
 	for (const pattern of patterns) {
-		const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+		const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*+/g, ".*");
 		if (new RegExp("^" + escaped + "$").test(name)) return true;
 	}
 	return false;
