@@ -87,7 +87,19 @@ src/
 
 Traces and logs are exported to `https://otel.pazer.tube` via Cloudflare's native OpenTelemetry export. 100% of requests are sampled.
 
-The destination named `otel-pazer-tube` must be configured in the [Cloudflare dashboard](https://dash.cloudflare.com/) under **Workers & Pages → Observability → Destinations**, pointing at `https://otel.pazer.tube` with appropriate auth headers.
+Two destinations must be created via the Cloudflare API (or dashboard) before deploying:
+
+```bash
+# Traces destination
+curl -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/observability/destinations" \
+  -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"otel-traces","enabled":true,"configuration":{"type":"logpush","logpushDataset":"opentelemetry-traces","url":"https://otel.pazer.tube/v1/traces","headers":{}}}'
+
+# Logs destination
+curl -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/observability/destinations" \
+  -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"otel-logs","enabled":true,"configuration":{"type":"logpush","logpushDataset":"opentelemetry-logs","url":"https://otel.pazer.tube/v1/logs","headers":{}}}'
+```
 
 See [Cloudflare docs](https://developers.cloudflare.com/workers/observability/exporting-opentelemetry-data/) for details.
 

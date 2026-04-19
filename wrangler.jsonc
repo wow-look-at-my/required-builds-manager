@@ -5,12 +5,12 @@
 	"observability": {
 		"traces": {
 			"enabled": true,
-			"destinations": ["otel-pazer-tube"],
+			"destinations": ["otel-traces"],
 			"head_sampling_rate": 1
 		},
 		"logs": {
 			"enabled": true,
-			"destinations": ["otel-pazer-tube"],
+			"destinations": ["otel-logs"],
 			"head_sampling_rate": 1
 		}
 	}

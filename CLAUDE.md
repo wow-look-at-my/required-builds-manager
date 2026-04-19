@@ -15,7 +15,7 @@ npx tsc --noEmit    # Type-check without emitting
 
 Traces and logs are exported to `https://otel.pazer.tube` via Cloudflare's native OTEL export (`wrangler.jsonc` → `observability` block). 100% sampling (`head_sampling_rate: 1`).
 
-The destination `otel-pazer-tube` must exist in the Cloudflare dashboard (Workers & Pages → Observability → Destinations) pointing at `https://otel.pazer.tube`.
+Two CF destinations must exist: `otel-traces` (dataset: `opentelemetry-traces`, URL: `https://otel.pazer.tube/v1/traces`) and `otel-logs` (dataset: `opentelemetry-logs`, URL: `https://otel.pazer.tube/v1/logs`). See README for the curl commands to create them.
 
 ## Deployment
 
