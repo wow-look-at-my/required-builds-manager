@@ -5,12 +5,12 @@
 	"observability": {
 		"traces": {
 			"enabled": true,
-			"destinations": ["otel-traces"],
+			"destinations": ["otel-cloudflare-traces"],
 			"head_sampling_rate": 1
 		},
 		"logs": {
 			"enabled": true,
-			"destinations": ["otel-logs"],
+			"destinations": ["otel-cloudflare-logs"],
 			"head_sampling_rate": 1
 		}
 	}

@@ -93,12 +93,12 @@ Two destinations must be created via the Cloudflare API (or dashboard) before de
 # Traces destination
 curl -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/observability/destinations" \
   -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
-  -d '{"name":"otel-traces","enabled":true,"configuration":{"type":"logpush","logpushDataset":"opentelemetry-traces","url":"https://otel.pazer.tube/v1/traces","headers":{}}}'
+  -d '{"name":"otel-cloudflare-traces","enabled":true,"configuration":{"type":"logpush","logpushDataset":"opentelemetry-traces","url":"https://otel.pazer.tube/v1/traces","headers":{}}}'
 
 # Logs destination
 curl -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/observability/destinations" \
   -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
-  -d '{"name":"otel-logs","enabled":true,"configuration":{"type":"logpush","logpushDataset":"opentelemetry-logs","url":"https://otel.pazer.tube/v1/logs","headers":{}}}'
+  -d '{"name":"otel-cloudflare-logs","enabled":true,"configuration":{"type":"logpush","logpushDataset":"opentelemetry-logs","url":"https://otel.pazer.tube/v1/logs","headers":{}}}'
 ```
 
 See [Cloudflare docs](https://developers.cloudflare.com/workers/observability/exporting-opentelemetry-data/) for details.
