@@ -83,6 +83,14 @@ src/
 └── verify.ts      # Webhook signature verification
 ```
 
+## Observability
+
+Traces and logs are exported to `https://otel.pazer.tube` via Cloudflare's native OpenTelemetry export. 100% of requests are sampled.
+
+The destination named `otel-pazer-tube` must be configured in the [Cloudflare dashboard](https://dash.cloudflare.com/) under **Workers & Pages → Observability → Destinations**, pointing at `https://otel.pazer.tube` with appropriate auth headers.
+
+See [Cloudflare docs](https://developers.cloudflare.com/workers/observability/exporting-opentelemetry-data/) for details.
+
 ## Deployment
 
 All deployments are handled through the CI/CD pipeline. Do not run `wrangler deploy` manually.
