@@ -1,5 +1,17 @@
 {
 	"name": "required-builds-manager",
 	"main": "src/index.ts",
-	"compatibility_date": "2025-01-01"
+	"compatibility_date": "2025-01-01",
+	"observability": {
+		"traces": {
+			"enabled": true,
+			"destinations": ["otel-cloudflare-traces"],
+			"head_sampling_rate": 1
+		},
+		"logs": {
+			"enabled": true,
+			"destinations": ["otel-cloudflare-logs"],
+			"head_sampling_rate": 1
+		}
+	}
 }
