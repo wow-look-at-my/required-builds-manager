@@ -13,7 +13,21 @@ npx tsc --noEmit    # Type-check without emitting
 
 ## Deployment
 
-**NEVER run `wrangler deploy`, `npx wrangler deploy`, or any manual deployment command.** All deployments are handled exclusively through the GitHub Actions CI/CD pipeline. There are no exceptions.
+**NEVER run `wrangler deploy`, `npx wrangler deploy`, or any manual deployment command.** Deploys are handled by **Cloudflare's Workers Builds GitHub integration**, which monitors this repo and deploys automatically on push to `master`. Manual deploys will stomp on that pipeline.
+
+### Note to future Claude: do not "fix" the missing deploy step
+
+You will look at `.github/workflows/ci.yml` and notice it only runs `npm ci`, `tsc --noEmit`, and `vitest run` — there is no `wrangler deploy` step, no Cloudflare API token, nothing that looks like a deploy. Despite the README and this file saying "deploys are handled through the CI/CD pipeline", the deploy does not happen in GitHub Actions.
+
+**This is correct. Do not change it.** Cloudflare's Workers Builds integration is configured on Cloudflare's side (not visible from the GitHub repo) and handles deploys on push. You cannot see this integration by inspecting the repo alone.
+
+Specifically, do NOT:
+- Add a `wrangler deploy` job to `.github/workflows/ci.yml`
+- Add a separate deploy workflow
+- Add a `CLOUDFLARE_API_TOKEN` secret reference
+- Report to the user that "the deploy pipeline is missing" — it isn't, you just can't see it
+
+If you are tempted to do any of the above because "the pipeline looks broken": stop, re-read this section, and confirm with the user before touching CI. Every time you make this mistake, you waste a turn and get corrected.
 
 ## Project Structure
 
@@ -91,13 +105,13 @@ npx vitest run test/aggregate.test.ts  # Run a single test file
 
 ## CI/CD
 
-The GitHub Actions pipeline (`.github/workflows/ci.yml`) runs on every push:
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and **only does checks, not deploys**:
 
 1. `npm ci` — clean install
 2. `npx tsc --noEmit` — type checking
 3. `npx vitest run` — tests
 
-Node.js 22 is used in CI.
+Node.js 22 is used in CI. Deploys happen separately via Cloudflare's GitHub integration (see Deployment section above).
 
 ## Code Conventions
 
