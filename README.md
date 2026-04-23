@@ -85,4 +85,4 @@ src/
 
 ## Deployment
 
-All deployments are handled through the CI/CD pipeline. Do not run `wrangler deploy` manually.
+Deploys are handled by **Cloudflare's Workers Builds GitHub integration**, which monitors this repo and deploys automatically on push to `master`. There is no `wrangler deploy` step in GitHub Actions — that is intentional. Do not run `wrangler deploy` manually or add a deploy step to CI; doing either will conflict with the Cloudflare-managed pipeline.
