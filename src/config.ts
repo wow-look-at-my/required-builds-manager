@@ -1,4 +1,5 @@
 import { parse as parseYaml } from "yaml";
+import { fetchWithRetry } from "./fetch-retry";
 
 export interface RepoConfig {
 	context: string;
@@ -47,7 +48,7 @@ async function fetchConfigFile(
 	repo: string,
 ): Promise<RepoConfig | null> {
 	const url = `${GITHUB_API}/repos/${owner}/${repo}/contents/${CONFIG_PATH}`;
-	const res = await fetch(url, {
+	const res = await fetchWithRetry(url, {
 		headers: {
 			Authorization: `token ${token}`,
 			Accept: "application/vnd.github.raw+json",

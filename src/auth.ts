@@ -1,3 +1,5 @@
+import { fetchWithRetry } from "./fetch-retry";
+
 interface AppEnv {
 	GITHUB_APP_ID: string;
 	GITHUB_APP_PRIVATE_KEY: string;
@@ -28,7 +30,7 @@ export async function getInstallationToken(
 
 	const jwt = await generateJwt(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY);
 
-	const res = await fetch(
+	const res = await fetchWithRetry(
 		`https://api.github.com/app/installations/${installationId}/access_tokens`,
 		{
 			method: "POST",

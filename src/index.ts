@@ -131,7 +131,13 @@ export default {
 
 		const [owner, repo] = fullName.split("/");
 
-		const config = await getRepoConfig(token, owner, repo);
+		let config: Awaited<ReturnType<typeof getRepoConfig>>;
+		try {
+			config = await getRepoConfig(token, owner, repo);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : "Unknown error";
+			return new Response(`Failed to fetch config: ${msg}`, { status: 502 });
+		}
 
 		// Prevent infinite loop — skip events from our own status context
 		if (event === "status" && incomingContext === config.context) {
@@ -149,15 +155,20 @@ export default {
 			config,
 		);
 
-		await createStatus(
-			token,
-			owner,
-			repo,
-			sha,
-			result.state,
-			config.context,
-			result.description,
-		);
+		try {
+			await createStatus(
+				token,
+				owner,
+				repo,
+				sha,
+				result.state,
+				config.context,
+				result.description,
+			);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : "Unknown error";
+			return new Response(`Failed to create status: ${msg}`, { status: 502 });
+		}
 
 		return new Response(JSON.stringify(result), {
 			status: 200,

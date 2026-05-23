@@ -170,20 +170,25 @@ describe("getRepoConfig", () => {
 		expect(config).toEqual({ context: "all-builds", ignore: [] });
 	});
 
-	it("returns defaults when API returns server error", async () => {
-		fetchMock
-			.get("https://api.github.com")
-			.intercept({
-				path: "/repos/myorg/myrepo/contents/.github/required-builds.yml",
-			})
-			.reply(500, "Internal Server Error");
+	it("returns defaults when API returns server error", { timeout: 15000 }, async () => {
+		// fetchWithRetry retries 500s up to 3 times (4 total attempts per URL)
+		for (let i = 0; i < 4; i++) {
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({
+					path: "/repos/myorg/myrepo/contents/.github/required-builds.yml",
+				})
+				.reply(500, "Internal Server Error");
+		}
 
-		fetchMock
-			.get("https://api.github.com")
-			.intercept({
-				path: "/repos/myorg/.github/contents/.github/required-builds.yml",
-			})
-			.reply(500, "Internal Server Error");
+		for (let i = 0; i < 4; i++) {
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({
+					path: "/repos/myorg/.github/contents/.github/required-builds.yml",
+				})
+				.reply(500, "Internal Server Error");
+		}
 
 		const config = await getRepoConfig("token", "myorg", "myrepo");
 		expect(config).toEqual({ context: "all-builds", ignore: [] });
