@@ -37,14 +37,16 @@ src/
 ├── aggregate.ts   # Low-water-mark aggregation: fetches all statuses + check-runs, deduplicates, computes combined state
 ├── auth.ts        # GitHub App JWT generation (RS256), installation token caching, PKCS#1/PKCS#8 key handling
 ├── config.ts      # Per-repo YAML config loading from .github/required-builds.yml (with org .github repo fallback)
+├── fetch-retry.ts # Retry wrapper with exponential backoff for transient HTTP errors
 ├── github.ts      # GitHub API client: listStatuses, listCheckRuns, createStatus (paginated)
 └── verify.ts      # HMAC-SHA256 webhook signature verification
 test/
-├── handler.test.ts    # Handler integration tests
-├── aggregate.test.ts  # Aggregation logic tests
-├── auth.test.ts       # JWT and token caching tests
-├── config.test.ts     # Config parsing, glob matching, and fetching tests
-└── verify.test.ts     # Signature verification tests
+├── handler.test.ts      # Handler integration tests
+├── aggregate.test.ts    # Aggregation logic tests
+├── auth.test.ts         # JWT and token caching tests
+├── config.test.ts       # Config parsing, glob matching, and fetching tests
+├── fetch-retry.test.ts  # Retry logic tests
+└── verify.test.ts       # Signature verification tests
 ```
 
 ## Tech Stack
@@ -63,7 +65,7 @@ test/
 1. Receive POST from GitHub (`x-github-event: status` or `check_run`)
 2. Verify HMAC-SHA256 signature (`x-hub-signature-256` header)
 3. Parse event, extract SHA/state/context/repo
-4. Authenticate as GitHub App: generate JWT → exchange for installation token (cached with 5-min threshold)
+4. Authenticate as GitHub App: generate JWT → exchange for installation token (cached in KV + in-memory with 5-min threshold)
 5. Fetch per-repo config from `.github/required-builds.yml` (falls back to org `.github` repo, then defaults)
 6. Skip if context matches the configured status name (prevents infinite loops)
 7. Aggregate: if incoming state is failure/error (and not ignored), short-circuit. Otherwise fetch all statuses + check-runs for the SHA, deduplicate by context/name, filter out ignored patterns, compute low-water-mark
@@ -71,7 +73,8 @@ test/
 
 ### Key Design Decisions
 
-- **Stateless**: No persistent storage — token cache is in-memory per Worker instance
+- **Token caching**: Installation tokens cached in Cloudflare KV (shared across all isolates) with in-memory fallback. KV is optional — if not bound, falls back to per-isolate in-memory cache only
+- **Retry with backoff**: All GitHub API calls use `fetchWithRetry` (3 retries, exponential backoff) for transient 5xx/429/network errors
 - **Per-repo config**: `.github/required-builds.yml` supports custom context name and ignore patterns (glob); falls back to org `.github` repo, then defaults
 - **Infinite loop prevention**: Ignores events where context matches the configured status name (default: "all-builds")
 - **Deduplication**: Statuses deduplicated by `context`, check-runs by `name` (API returns newest first)
@@ -87,6 +90,12 @@ Set as Cloudflare Worker secrets (never commit these):
 | `GITHUB_APP_ID` | GitHub App identifier |
 | `GITHUB_APP_PRIVATE_KEY` | PEM-encoded RSA private key (PKCS#1 or PKCS#8) |
 | `WEBHOOK_SECRET` | GitHub webhook HMAC secret |
+
+### KV Bindings
+
+| Binding | Description |
+|---|---|
+| `TOKEN_CACHE` | KV namespace for caching GitHub installation tokens across isolates (optional -- falls back to in-memory) |
 
 ## Testing
 

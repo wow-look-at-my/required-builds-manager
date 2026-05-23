@@ -171,6 +171,7 @@ describe("worker fetch handler", () => {
 		expect(mockedGetToken).toHaveBeenCalledWith(
 			expect.objectContaining({ GITHUB_APP_ID: "12345" }),
 			12345,
+			expect.anything(),
 		);
 		expect(mockedGetRepoConfig).toHaveBeenCalledWith(
 			"test-installation-token",

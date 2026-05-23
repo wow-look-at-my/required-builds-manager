@@ -8,6 +8,7 @@ interface Env {
 	GITHUB_APP_ID: string;
 	GITHUB_APP_PRIVATE_KEY: string;
 	WEBHOOK_SECRET: string;
+	TOKEN_CACHE?: KVNamespace;
 }
 
 interface StatusEvent {
@@ -123,7 +124,7 @@ export default {
 
 		let token: string;
 		try {
-			token = await getInstallationToken(env, installationId);
+			token = await getInstallationToken(env, installationId, env.TOKEN_CACHE);
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : "Unknown error";
 			return new Response(`Failed to authenticate: ${msg}`, { status: 500 });
