@@ -17,13 +17,31 @@ When any CI system reports a status or check run on a commit, this worker:
 
 This lets you use a single required status check (`all-builds`) in your branch protection rules instead of listing every individual CI job.
 
+## Per-Repo Configuration
+
+Optionally create `.github/required-builds.yml` in a repository to customize behavior:
+
+```yaml
+# Custom context name for the combined status (default: "all-builds")
+context: "ci/combined"
+
+# Glob patterns for statuses/check-runs to exclude from aggregation
+ignore:
+  - "codecov/*"
+  - "docs-preview"
+```
+
+**Fallback chain**: repo `.github/required-builds.yml` → org-level `.github` repo → defaults.
+
+If no config file exists, the app uses `all-builds` as the context with no ignore patterns.
+
 ## Setup
 
 ### Prerequisites
 
 - A [GitHub App](https://docs.github.com/en/apps/creating-github-apps) with:
   - **Webhook events**: `Status`, `Check run`
-  - **Permissions**: `Commit statuses` (read & write), `Checks` (read)
+  - **Permissions**: `Commit statuses` (read & write), `Checks` (read), `Contents` (read)
 - A [Cloudflare Workers](https://workers.cloudflare.com/) account
 
 ### Configuration
@@ -60,10 +78,11 @@ src/
 ├── index.ts       # Worker entry point and webhook handler
 ├── aggregate.ts   # Build state aggregation logic
 ├── auth.ts        # GitHub App authentication (JWT, installation tokens)
+├── config.ts      # Per-repo YAML config loading (with org fallback)
 ├── github.ts      # GitHub API client (statuses, check runs)
 └── verify.ts      # Webhook signature verification
 ```
 
 ## Deployment
 
-All deployments are handled through the CI/CD pipeline. Do not run `wrangler deploy` manually.
+Deploys are handled by **Cloudflare's Workers Builds GitHub integration**, which monitors this repo and deploys automatically on push to `master`. There is no `wrangler deploy` step in GitHub Actions — that is intentional. Do not run `wrangler deploy` manually or add a deploy step to CI; doing either will conflict with the Cloudflare-managed pipeline.

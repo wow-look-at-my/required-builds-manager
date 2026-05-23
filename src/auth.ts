@@ -1,3 +1,5 @@
+import { fetchWithRetry } from "./fetch-retry";
+
 interface AppEnv {
 	GITHUB_APP_ID: string;
 	GITHUB_APP_PRIVATE_KEY: string;
@@ -13,22 +15,37 @@ const tokenCache = new Map<number, CachedToken>();
 export async function getInstallationToken(
 	env: Pick<AppEnv, "GITHUB_APP_ID" | "GITHUB_APP_PRIVATE_KEY">,
 	installationId: number,
+	kv?: KVNamespace,
 ): Promise<string> {
 	if (!env.GITHUB_APP_PRIVATE_KEY) {
 		throw new Error("Missing GITHUB_APP_PRIVATE_KEY");
 	}
 
-	const cached = tokenCache.get(installationId);
 	const now = Math.floor(Date.now() / 1000);
+	const kvKey = `installation-token:${installationId}`;
 
-	// Reuse if >5 min remaining
-	if (cached && cached.expiresAt - now > 300) {
-		return cached.token;
+	// Check in-memory cache first
+	const memCached = tokenCache.get(installationId);
+	if (memCached && memCached.expiresAt - now > 300) {
+		return memCached.token;
+	}
+
+	// Check KV cache (shared across all isolates)
+	if (kv) {
+		try {
+			const kvVal = await kv.get(kvKey, "json") as CachedToken | null;
+			if (kvVal && kvVal.expiresAt - now > 300) {
+				tokenCache.set(installationId, kvVal);
+				return kvVal.token;
+			}
+		} catch {
+			// KV read failed -- fall through to GitHub API
+		}
 	}
 
 	const jwt = await generateJwt(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY);
 
-	const res = await fetch(
+	const res = await fetchWithRetry(
 		`https://api.github.com/app/installations/${installationId}/access_tokens`,
 		{
 			method: "POST",
@@ -46,8 +63,17 @@ export async function getInstallationToken(
 
 	const data: { token: string; expires_at: string } = await res.json();
 	const expiresAt = Math.floor(new Date(data.expires_at).getTime() / 1000);
+	const cached: CachedToken = { token: data.token, expiresAt };
 
-	tokenCache.set(installationId, { token: data.token, expiresAt });
+	tokenCache.set(installationId, cached);
+
+	// Write to KV (fire-and-forget, TTL matches token expiry)
+	if (kv) {
+		const ttlSeconds = expiresAt - now;
+		if (ttlSeconds > 300) {
+			kv.put(kvKey, JSON.stringify(cached), { expirationTtl: ttlSeconds }).catch(() => {});
+		}
+	}
 
 	return data.token;
 }
@@ -98,15 +124,12 @@ function pemToDer(pem: string): ArrayBuffer {
 		.replace(/\r\n/g, "\n")
 		.trim();
 
-	console.log(`PEM key format: starts with "${normalized.substring(0, 30)}...", length=${normalized.length}`);
-
 	if (normalized.includes("BEGIN PRIVATE KEY")) {
 		// PKCS#8 format — use directly
 		const b64 = normalized
 			.replace(/-----BEGIN PRIVATE KEY-----/, "")
 			.replace(/-----END PRIVATE KEY-----/, "")
 			.replace(/\s/g, "");
-		console.log(`PKCS#8 base64 length: ${b64.length}`);
 		return base64ToArrayBuffer(b64);
 	}
 
@@ -116,7 +139,6 @@ function pemToDer(pem: string): ArrayBuffer {
 			.replace(/-----BEGIN RSA PRIVATE KEY-----/, "")
 			.replace(/-----END RSA PRIVATE KEY-----/, "")
 			.replace(/\s/g, "");
-		console.log(`PKCS#1 base64 length: ${b64.length}`);
 		const pkcs1 = new Uint8Array(base64ToArrayBuffer(b64));
 		return pkcs1ToPkcs8(pkcs1);
 	}

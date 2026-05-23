@@ -5,6 +5,7 @@ import * as verify from "../src/verify";
 import * as aggregate from "../src/aggregate";
 import * as github from "../src/github";
 import * as auth from "../src/auth";
+import * as config from "../src/config";
 
 vi.mock("../src/verify", () => ({
 	verifySignature: vi.fn(),
@@ -22,10 +23,17 @@ vi.mock("../src/auth", () => ({
 	getInstallationToken: vi.fn(),
 }));
 
+vi.mock("../src/config", () => ({
+	getRepoConfig: vi.fn(),
+}));
+
 const mockedVerify = vi.mocked(verify.verifySignature);
 const mockedCompute = vi.mocked(aggregate.computeAllBuildsState);
 const mockedCreateStatus = vi.mocked(github.createStatus);
 const mockedGetToken = vi.mocked(auth.getInstallationToken);
+const mockedGetRepoConfig = vi.mocked(config.getRepoConfig);
+
+const defaultConfig = { context: "all-builds", ignore: [] };
 
 function makeRequest(
 	body: object,
@@ -86,6 +94,7 @@ describe("worker fetch handler", () => {
 		mockedCompute.mockResolvedValue({ state: "success", description: "All builds passed" });
 		mockedCreateStatus.mockResolvedValue(undefined);
 		mockedGetToken.mockResolvedValue("test-installation-token");
+		mockedGetRepoConfig.mockResolvedValue(defaultConfig);
 	});
 
 	it("rejects non-POST methods", async () => {
@@ -126,12 +135,22 @@ describe("worker fetch handler", () => {
 		expect(res.status).toBe(401);
 	});
 
-	it("ignores all-builds context", async () => {
+	it("ignores all-builds context (default config)", async () => {
 		const req = makeRequest({ ...statusPayload, context: "all-builds" });
 		const res = await worker.fetch(req, env as any);
 
 		expect(res.status).toBe(200);
 		expect(await res.text()).toBe("Ignored all-builds context");
+		expect(mockedCompute).not.toHaveBeenCalled();
+	});
+
+	it("ignores custom context from config", async () => {
+		mockedGetRepoConfig.mockResolvedValue({ context: "custom-status", ignore: [] });
+		const req = makeRequest({ ...statusPayload, context: "custom-status" });
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe("Ignored custom-status context");
 		expect(mockedCompute).not.toHaveBeenCalled();
 	});
 
@@ -152,6 +171,12 @@ describe("worker fetch handler", () => {
 		expect(mockedGetToken).toHaveBeenCalledWith(
 			expect.objectContaining({ GITHUB_APP_ID: "12345" }),
 			12345,
+			expect.anything(),
+		);
+		expect(mockedGetRepoConfig).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
 		);
 		expect(mockedCompute).toHaveBeenCalledWith(
 			"test-installation-token",
@@ -159,7 +184,9 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"success",
+			"ci/tests",
 			12345,
+			defaultConfig,
 		);
 		expect(mockedCreateStatus).toHaveBeenCalledWith(
 			"test-installation-token",
@@ -168,6 +195,25 @@ describe("worker fetch handler", () => {
 			"abc123def",
 			"success",
 			"all-builds",
+			"All builds passed",
+		);
+	});
+
+	it("uses custom context from config when creating status", async () => {
+		const customConfig = { context: "combined-ci", ignore: [] };
+		mockedGetRepoConfig.mockResolvedValue(customConfig);
+
+		const req = makeRequest(statusPayload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCreateStatus).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"success",
+			"combined-ci",
 			"All builds passed",
 		);
 	});
@@ -194,7 +240,9 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"success",
+			"build",
 			12345,
+			defaultConfig,
 		);
 	});
 
@@ -213,7 +261,9 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"pending",
+			"build",
 			12345,
+			defaultConfig,
 		);
 	});
 
@@ -232,7 +282,9 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"pending",
+			"build",
 			12345,
+			defaultConfig,
 		);
 	});
 
@@ -251,7 +303,9 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"failure",
+			"build",
 			12345,
+			defaultConfig,
 		);
 	});
 
@@ -270,7 +324,9 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"failure",
+			"build",
 			12345,
+			defaultConfig,
 		);
 	});
 
@@ -289,7 +345,9 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"success",
+			"build",
 			12345,
+			defaultConfig,
 		);
 	});
 
@@ -308,7 +366,9 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"success",
+			"build",
 			12345,
+			defaultConfig,
 		);
 	});
 
@@ -327,7 +387,9 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"pending",
+			"build",
 			12345,
+			defaultConfig,
 		);
 	});
 
@@ -346,7 +408,9 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"success",
+			"all-builds",
 			12345,
+			defaultConfig,
 		);
 	});
 

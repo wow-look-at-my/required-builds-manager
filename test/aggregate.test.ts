@@ -19,7 +19,7 @@ describe("computeAllBuildsState", () => {
 	});
 
 	it("failure fast path — no API call needed", async () => {
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "failure");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "failure", "ci/tests");
 
 		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 		expect(mockedListStatuses).not.toHaveBeenCalled();
@@ -27,7 +27,7 @@ describe("computeAllBuildsState", () => {
 	});
 
 	it("error fast path — no API call needed", async () => {
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "error");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "error", "ci/tests");
 
 		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 		expect(mockedListStatuses).not.toHaveBeenCalled();
@@ -40,7 +40,7 @@ describe("computeAllBuildsState", () => {
 			{ state: "success", context: "lint", id: 2 },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "success", description: "All builds passed" });
 	});
@@ -51,7 +51,7 @@ describe("computeAllBuildsState", () => {
 			{ state: "pending", context: "lint", id: 2 },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
 	});
@@ -62,7 +62,7 @@ describe("computeAllBuildsState", () => {
 			{ state: "failure", context: "lint", id: 2 },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 	});
@@ -72,7 +72,7 @@ describe("computeAllBuildsState", () => {
 			{ state: "success", context: "ci", id: 1 },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "ci");
 
 		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
 	});
@@ -82,7 +82,7 @@ describe("computeAllBuildsState", () => {
 			{ state: "failure", context: "ci", id: 1 },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "lint");
 
 		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 	});
@@ -93,19 +93,19 @@ describe("computeAllBuildsState", () => {
 			{ state: "pending", context: "ci", id: 1 },  // older
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "success", description: "All builds passed" });
 	});
 
 	it("no other statuses or check runs — success incoming", async () => {
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "success", description: "All builds passed" });
 	});
 
 	it("no other statuses or check runs — pending incoming", async () => {
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "ci");
 
 		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
 	});
@@ -116,7 +116,19 @@ describe("computeAllBuildsState", () => {
 			{ state: "success", context: "ci", id: 2 },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
+
+		expect(result).toEqual({ state: "success", description: "All builds passed" });
+	});
+
+	it("filters out custom context name from config", async () => {
+		mockedListStatuses.mockResolvedValue([
+			{ state: "failure", context: "custom-builds", id: 1 },
+			{ state: "success", context: "ci", id: 2 },
+		]);
+
+		const config = { context: "custom-builds", ignore: [] };
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci", undefined, config);
 
 		expect(result).toEqual({ state: "success", description: "All builds passed" });
 	});
@@ -124,7 +136,7 @@ describe("computeAllBuildsState", () => {
 	it("returns error when API fetch fails", async () => {
 		mockedListStatuses.mockRejectedValue(new Error("API error"));
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "error", description: "Failed to fetch commit statuses" });
 	});
@@ -137,7 +149,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "test", status: "completed", conclusion: "success" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "success", description: "All builds passed" });
 	});
@@ -147,7 +159,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "in_progress", conclusion: null },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
 	});
@@ -157,7 +169,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "queued", conclusion: null },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
 	});
@@ -167,7 +179,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "completed", conclusion: "failure" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 	});
@@ -177,7 +189,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "deploy", status: "completed", conclusion: "timed_out" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 	});
@@ -187,7 +199,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "deploy", status: "completed", conclusion: "cancelled" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 	});
@@ -197,7 +209,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "optional", status: "completed", conclusion: "neutral" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "success", description: "All builds passed" });
 	});
@@ -207,7 +219,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "optional", status: "completed", conclusion: "skipped" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "success", description: "All builds passed" });
 	});
@@ -217,7 +229,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "completed", conclusion: "stale" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
 	});
@@ -229,7 +241,7 @@ describe("computeAllBuildsState", () => {
 		]);
 
 		// Without appId, the all-builds check run is included and causes failure
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 	});
 
@@ -240,7 +252,7 @@ describe("computeAllBuildsState", () => {
 		]);
 
 		// With matching appId, the check run from our app is excluded
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", 99999);
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci", 99999);
 		expect(result).toEqual({ state: "success", description: "All builds passed" });
 	});
 
@@ -251,7 +263,7 @@ describe("computeAllBuildsState", () => {
 		]);
 
 		// app.id doesn't match — check run is included
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", 99999);
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci", 99999);
 		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 	});
 
@@ -261,7 +273,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "completed", conclusion: "failure" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "success", description: "All builds passed" });
 	});
@@ -276,7 +288,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "completed", conclusion: "success" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci/lint");
 
 		expect(result).toEqual({ state: "success", description: "All builds passed" });
 	});
@@ -289,7 +301,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "in_progress", conclusion: null },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci/lint");
 
 		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
 	});
@@ -302,7 +314,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "completed", conclusion: "success" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci/lint");
 
 		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 	});
@@ -315,7 +327,7 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "completed", conclusion: "failure" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci/lint");
 
 		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 	});
@@ -323,8 +335,99 @@ describe("computeAllBuildsState", () => {
 	it("returns error when check runs fetch fails", async () => {
 		mockedListCheckRuns.mockRejectedValue(new Error("API error"));
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
 		expect(result).toEqual({ state: "error", description: "Failed to fetch commit statuses" });
+	});
+
+	// Ignore pattern tests
+
+	describe("with ignore patterns", () => {
+		const configWithIgnore = { context: "all-builds", ignore: ["codecov/*", "docs-preview"] };
+
+		it("excludes ignored statuses from aggregation", async () => {
+			mockedListStatuses.mockResolvedValue([
+				{ state: "failure", context: "codecov/project", id: 1 },
+				{ state: "success", context: "ci", id: 2 },
+			]);
+
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "success", "ci", undefined, configWithIgnore,
+			);
+
+			expect(result).toEqual({ state: "success", description: "All builds passed" });
+		});
+
+		it("excludes ignored check runs from aggregation", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "docs-preview", status: "completed", conclusion: "failure" },
+				{ name: "build", status: "completed", conclusion: "success" },
+			]);
+
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "success", "ci", undefined, configWithIgnore,
+			);
+
+			expect(result).toEqual({ state: "success", description: "All builds passed" });
+		});
+
+		it("skips failure fast path when incoming context is ignored", async () => {
+			mockedListStatuses.mockResolvedValue([
+				{ state: "success", context: "ci", id: 1 },
+			]);
+
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "failure", "codecov/project", undefined, configWithIgnore,
+			);
+
+			// Should NOT short-circuit to failure — codecov is ignored
+			expect(result).toEqual({ state: "success", description: "All builds passed" });
+			expect(mockedListStatuses).toHaveBeenCalled();
+		});
+
+		it("does not factor in ignored incoming pending state", async () => {
+			mockedListStatuses.mockResolvedValue([
+				{ state: "success", context: "ci", id: 1 },
+			]);
+
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "pending", "codecov/project", undefined, configWithIgnore,
+			);
+
+			expect(result).toEqual({ state: "success", description: "All builds passed" });
+		});
+
+		it("returns success when all entries are ignored and no relevant builds exist", async () => {
+			mockedListStatuses.mockResolvedValue([
+				{ state: "failure", context: "codecov/project", id: 1 },
+			]);
+
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "failure", "codecov/project", undefined, configWithIgnore,
+			);
+
+			expect(result).toEqual({ state: "success", description: "All builds passed" });
+		});
+
+		it("non-matching patterns do not affect aggregation", async () => {
+			mockedListStatuses.mockResolvedValue([
+				{ state: "failure", context: "ci/tests", id: 1 },
+			]);
+
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "success", "ci/tests", undefined, configWithIgnore,
+			);
+
+			expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+		});
+
+		it("still applies failure fast path for non-ignored incoming", async () => {
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "failure", "ci/tests", undefined, configWithIgnore,
+			);
+
+			expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+			expect(mockedListStatuses).not.toHaveBeenCalled();
+		});
 	});
 });

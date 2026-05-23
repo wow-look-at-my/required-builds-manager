@@ -1,5 +1,20 @@
 {
 	"name": "required-builds-manager",
 	"main": "src/index.ts",
-	"compatibility_date": "2025-01-01"
+	"compatibility_date": "2025-01-01",
+	"kv_namespaces": [
+		{ "binding": "TOKEN_CACHE", "id": "956ebbd72c98416d80af29f302e5e8ad" }
+	],
+	"observability": {
+		"traces": {
+			"enabled": true,
+			"destinations": ["otel-cloudflare-traces"],
+			"head_sampling_rate": 1
+		},
+		"logs": {
+			"enabled": true,
+			"destinations": ["otel-cloudflare-logs"],
+			"head_sampling_rate": 1
+		}
+	}
 }
