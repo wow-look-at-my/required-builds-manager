@@ -11,6 +11,8 @@ export interface CheckRun {
 	app?: { id: number };
 }
 
+import { fetchWithRetry } from "./fetch-retry";
+
 const GITHUB_API = "https://api.github.com";
 
 export async function listStatuses(
@@ -24,7 +26,7 @@ export async function listStatuses(
 
 	for (;;) {
 		const url = `${GITHUB_API}/repos/${owner}/${repo}/statuses/${sha}?per_page=100&page=${page}`;
-		const res = await fetch(url, {
+		const res = await fetchWithRetry(url, {
 			headers: {
 				Authorization: `token ${token}`,
 				Accept: "application/vnd.github+json",
@@ -58,7 +60,7 @@ export async function listCheckRuns(
 
 	for (;;) {
 		const url = `${GITHUB_API}/repos/${owner}/${repo}/commits/${sha}/check-runs?per_page=100&page=${page}`;
-		const res = await fetch(url, {
+		const res = await fetchWithRetry(url, {
 			headers: {
 				Authorization: `token ${token}`,
 				Accept: "application/vnd.github+json",
@@ -91,7 +93,7 @@ export async function createStatus(
 	description: string,
 ): Promise<void> {
 	const url = `${GITHUB_API}/repos/${owner}/${repo}/statuses/${sha}`;
-	const res = await fetch(url, {
+	const res = await fetchWithRetry(url, {
 		method: "POST",
 		headers: {
 			Authorization: `token ${token}`,

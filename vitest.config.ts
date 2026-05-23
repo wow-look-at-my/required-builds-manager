@@ -11,6 +11,7 @@ export default defineWorkersConfig({
 						GITHUB_APP_PRIVATE_KEY: "test-private-key",
 						WEBHOOK_SECRET: "test-secret",
 					},
+					kvNamespaces: ["TOKEN_CACHE"],
 				},
 			},
 		},
