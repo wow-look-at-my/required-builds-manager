@@ -1,19 +1,23 @@
 # Required Builds Manager
 
-A Cloudflare Worker that aggregates GitHub commit statuses and check runs into a single combined "all-builds" status. Install it as a GitHub App to get a unified pass/fail signal across all your CI checks.
+A Cloudflare Worker that aggregates GitHub commit statuses, check runs, and workflow runs into a single combined "all-builds" status. Install it as a GitHub App to get a unified pass/fail signal across all your CI checks.
 
 ## How It Works
 
-When any CI system reports a status or check run on a commit, this worker:
+When any CI system reports a status, check run, or workflow run on a commit, this worker:
 
 1. Receives the webhook event from GitHub
-2. Fetches all statuses and check runs for that commit
-3. Deduplicates them (by context for statuses, by name for check runs)
+2. Fetches all statuses, check runs, and workflow runs for that commit
+3. Deduplicates them (by context for statuses, by name for check runs and workflow runs)
 4. Computes an aggregate state using a low-water-mark algorithm:
    - **failure** if any build failed
    - **pending** if any build is still running
    - **success** only if all builds passed
 5. Posts the result back as an "all-builds" commit status
+
+### Catching workflow startup failures
+
+When a workflow's YAML is invalid (or it otherwise fails before any job runs), GitHub records it as a `startup_failure` workflow run that produces **zero check runs and zero statuses** — invisible to the statuses and check-runs APIs. The worker also listens for `workflow_run` events and folds any `startup_failure` into the aggregate, so a broken workflow blocks the `all-builds` check instead of silently passing. (This requires the `Actions` read permission; if it's missing, the worker degrades gracefully and simply skips this check.)
 
 This lets you use a single required status check (`all-builds`) in your branch protection rules instead of listing every individual CI job.
 
@@ -40,8 +44,8 @@ If no config file exists, the app uses `all-builds` as the context with no ignor
 ### Prerequisites
 
 - A [GitHub App](https://docs.github.com/en/apps/creating-github-apps) with:
-  - **Webhook events**: `Status`, `Check run`
-  - **Permissions**: `Commit statuses` (read & write), `Checks` (read), `Contents` (read)
+  - **Webhook events**: `Status`, `Check run`, `Workflow run`
+  - **Permissions**: `Commit statuses` (read & write), `Checks` (read), `Actions` (read), `Contents` (read)
 - A [Cloudflare Workers](https://workers.cloudflare.com/) account
 
 ### Configuration
@@ -79,7 +83,7 @@ src/
 ├── aggregate.ts   # Build state aggregation logic
 ├── auth.ts        # GitHub App authentication (JWT, installation tokens)
 ├── config.ts      # Per-repo YAML config loading (with org fallback)
-├── github.ts      # GitHub API client (statuses, check runs)
+├── github.ts      # GitHub API client (statuses, check runs, workflow runs)
 └── verify.ts      # Webhook signature verification
 ```
 

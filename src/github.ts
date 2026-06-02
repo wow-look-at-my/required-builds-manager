@@ -11,6 +11,13 @@ export interface CheckRun {
 	app?: { id: number };
 }
 
+export interface WorkflowRun {
+	name: string | null;
+	status: string;
+	conclusion: string | null;
+	head_sha: string;
+}
+
 import { fetchWithRetry } from "./fetch-retry";
 
 const GITHUB_API = "https://api.github.com";
@@ -77,6 +84,40 @@ export async function listCheckRuns(
 
 		all.push(...data.check_runs);
 		if (data.check_runs.length < 100) break;
+		page++;
+	}
+
+	return all;
+}
+
+export async function listWorkflowRuns(
+	token: string,
+	owner: string,
+	repo: string,
+	sha: string,
+): Promise<WorkflowRun[]> {
+	const all: WorkflowRun[] = [];
+	let page = 1;
+
+	for (;;) {
+		const url = `${GITHUB_API}/repos/${owner}/${repo}/actions/runs?head_sha=${sha}&per_page=100&page=${page}`;
+		const res = await fetchWithRetry(url, {
+			headers: {
+				Authorization: `token ${token}`,
+				Accept: "application/vnd.github+json",
+				"User-Agent": "required-builds-manager",
+			},
+		});
+
+		if (!res.ok) {
+			throw new Error(`GitHub API error: ${res.status} ${res.statusText}`);
+		}
+
+		const data: { workflow_runs: WorkflowRun[] } = await res.json();
+		if (data.workflow_runs.length === 0) break;
+
+		all.push(...data.workflow_runs);
+		if (data.workflow_runs.length < 100) break;
 		page++;
 	}
 

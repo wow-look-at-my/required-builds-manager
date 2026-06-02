@@ -67,6 +67,22 @@ function makeCheckRunRequest(
 	});
 }
 
+function makeWorkflowRunRequest(
+	body: object,
+	headers: Record<string, string> = {},
+): Request {
+	return new Request("https://worker.example.com/webhook", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"x-github-event": "workflow_run",
+			"x-hub-signature-256": "sha256=abc123",
+			...headers,
+		},
+		body: JSON.stringify(body),
+	});
+}
+
 const statusPayload = {
 	state: "success",
 	context: "ci/tests",
@@ -81,6 +97,18 @@ const checkRunPayload = {
 		name: "build",
 		status: "completed",
 		conclusion: "success",
+		head_sha: "abc123def",
+	},
+	repository: { full_name: "myorg/myrepo" },
+	installation: { id: 12345 },
+};
+
+const workflowRunPayload = {
+	action: "completed",
+	workflow_run: {
+		name: "CI",
+		status: "completed",
+		conclusion: "startup_failure",
 		head_sha: "abc123def",
 	},
 	repository: { full_name: "myorg/myrepo" },
@@ -417,6 +445,108 @@ describe("worker fetch handler", () => {
 	it("returns 400 for check_run with missing installation ID", async () => {
 		const { installation: _, ...payloadNoInstall } = checkRunPayload;
 		const req = makeCheckRunRequest(payloadNoInstall);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(400);
+		expect(await res.text()).toBe("Missing installation ID in webhook payload");
+	});
+
+	// workflow_run event tests
+
+	it("maps workflow_run startup_failure to failure", async () => {
+		mockedCompute.mockResolvedValue({ state: "failure", description: "One or more builds failed" });
+		const req = makeWorkflowRunRequest(workflowRunPayload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"failure",
+			"CI",
+			12345,
+			defaultConfig,
+		);
+		expect(mockedCreateStatus).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"failure",
+			"all-builds",
+			"One or more builds failed",
+		);
+	});
+
+	it("maps completed successful workflow_run to success", async () => {
+		const payload = {
+			...workflowRunPayload,
+			workflow_run: { ...workflowRunPayload.workflow_run, conclusion: "success" },
+		};
+		const req = makeWorkflowRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"success",
+			"CI",
+			12345,
+			defaultConfig,
+		);
+	});
+
+	it("maps in-progress workflow_run to pending", async () => {
+		const payload = {
+			...workflowRunPayload,
+			action: "in_progress",
+			workflow_run: { ...workflowRunPayload.workflow_run, status: "in_progress", conclusion: null },
+		};
+		const req = makeWorkflowRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"pending",
+			"CI",
+			12345,
+			defaultConfig,
+		);
+	});
+
+	it("handles workflow_run with null name", async () => {
+		const payload = {
+			...workflowRunPayload,
+			workflow_run: { ...workflowRunPayload.workflow_run, name: null },
+		};
+		const req = makeWorkflowRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"failure",
+			"",
+			12345,
+			defaultConfig,
+		);
+	});
+
+	it("returns 400 for workflow_run with missing installation ID", async () => {
+		const { installation: _, ...payloadNoInstall } = workflowRunPayload;
+		const req = makeWorkflowRunRequest(payloadNoInstall);
 		const res = await worker.fetch(req, env as any);
 
 		expect(res.status).toBe(400);
