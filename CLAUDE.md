@@ -1,6 +1,6 @@
 # Required Builds Manager
 
-A Cloudflare Worker that acts as a GitHub App webhook handler. It listens for `status` and `check_run` events, aggregates all build states for a commit, and publishes a single "all-builds" combined status using a low-water-mark algorithm (failure > pending > success).
+A Cloudflare Worker that acts as a GitHub App webhook handler. It listens for `status`, `check_run`, and `workflow_run` events, aggregates all build states for a commit, and publishes a single "all-builds" combined status using a low-water-mark algorithm (failure > pending > success). Listening for `workflow_run` lets it catch `startup_failure` (e.g. invalid workflow YAML), which produces no statuses or check runs and would otherwise be invisible.
 
 ## Quick Reference
 
@@ -33,12 +33,12 @@ If you are tempted to do any of the above because "the pipeline looks broken": s
 
 ```
 src/
-├── index.ts       # Worker entry point — POST webhook handler, event routing, check-run state mapping
-├── aggregate.ts   # Low-water-mark aggregation: fetches all statuses + check-runs, deduplicates, computes combined state
+├── index.ts       # Worker entry point — POST webhook handler, event routing, check-run/workflow-run state mapping
+├── aggregate.ts   # Low-water-mark aggregation: fetches all statuses + check-runs + workflow-runs, deduplicates, computes combined state
 ├── auth.ts        # GitHub App JWT generation (RS256), installation token caching, PKCS#1/PKCS#8 key handling
 ├── config.ts      # Per-repo YAML config loading from .github/required-builds.yml (with org .github repo fallback)
 ├── fetch-retry.ts # Retry wrapper with exponential backoff for transient HTTP errors
-├── github.ts      # GitHub API client: listStatuses, listCheckRuns, createStatus (paginated)
+├── github.ts      # GitHub API client: listStatuses, listCheckRuns, listWorkflowRuns, createStatus (paginated)
 └── verify.ts      # HMAC-SHA256 webhook signature verification
 test/
 ├── handler.test.ts      # Handler integration tests
@@ -62,13 +62,13 @@ test/
 
 ### Webhook Flow
 
-1. Receive POST from GitHub (`x-github-event: status` or `check_run`)
+1. Receive POST from GitHub (`x-github-event: status`, `check_run`, or `workflow_run`)
 2. Verify HMAC-SHA256 signature (`x-hub-signature-256` header)
-3. Parse event, extract SHA/state/context/repo
+3. Parse event, extract SHA/state/context/repo (workflow-run name may be null → treated as empty context)
 4. Authenticate as GitHub App: generate JWT → exchange for installation token (cached in KV + in-memory with 5-min threshold)
 5. Fetch per-repo config from `.github/required-builds.yml` (falls back to org `.github` repo, then defaults)
 6. Skip if context matches the configured status name (prevents infinite loops)
-7. Aggregate: if incoming state is failure/error (and not ignored), short-circuit. Otherwise fetch all statuses + check-runs for the SHA, deduplicate by context/name, filter out ignored patterns, compute low-water-mark
+7. Aggregate: if incoming state is failure/error (and not ignored), short-circuit. Otherwise fetch all statuses + check-runs + workflow-runs for the SHA, deduplicate by context/name, filter out ignored patterns, compute low-water-mark
 8. POST the combined status back to GitHub using the configured context name
 
 ### Key Design Decisions
@@ -77,8 +77,9 @@ test/
 - **Retry with backoff**: All GitHub API calls use `fetchWithRetry` (3 retries, exponential backoff) for transient 5xx/429/network errors
 - **Per-repo config**: `.github/required-builds.yml` supports custom context name and ignore patterns (glob); falls back to org `.github` repo, then defaults
 - **Infinite loop prevention**: Ignores events where context matches the configured status name (default: "all-builds")
-- **Deduplication**: Statuses deduplicated by `context`, check-runs by `name` (API returns newest first)
+- **Deduplication**: Statuses deduplicated by `context`, check-runs and workflow-runs by `name` (API returns newest first)
 - **Check-run mapping**: `queued`/`in_progress` → pending; completed with `success`/`neutral`/`skipped` → success; `failure`/`timed_out`/`cancelled`/`action_required` → failure; `stale` → pending
+- **Startup-failure detection**: A `startup_failure` workflow run (e.g. invalid workflow YAML) creates NO check runs or statuses, so it's invisible to `listStatuses`/`listCheckRuns`. Aggregation also calls `listWorkflowRuns(head_sha)` and folds any failure-concluding workflow run (notably `startup_failure`) into the low-water-mark — so a broken workflow blocks `all-builds` and, because aggregation re-queries on every event, the failure persists even when a later passing build re-triggers aggregation. The fetch is best-effort: if it fails (e.g. the app lacks `actions:read`, or Actions is disabled), it degrades to `[]` rather than erroring the whole aggregation. Only failure-concluding runs are added; passing/pending workflows are already represented by their own check runs.
 - **PKCS#1 support**: Manually wraps PKCS#1 RSA keys in PKCS#8 DER envelope for Web Crypto compatibility
 
 ## Environment Variables

@@ -1,4 +1,4 @@
-import { listStatuses, listCheckRuns } from "./github";
+import { listStatuses, listCheckRuns, listWorkflowRuns, type WorkflowRun } from "./github";
 import { type RepoConfig, matchesIgnorePattern } from "./config";
 
 export interface AggregateResult {
@@ -30,6 +30,30 @@ function mapCheckRunState(status: string, conclusion: string | null): SimpleStat
 	}
 }
 
+function mapWorkflowRunState(status: string, conclusion: string | null): SimpleState {
+	if (status !== "completed") return "pending";
+
+	switch (conclusion) {
+		case "success":
+		case "neutral":
+		case "skipped":
+			return "success";
+		case "failure":
+		case "timed_out":
+		case "cancelled":
+		case "action_required":
+		// A workflow whose YAML is invalid (or otherwise fails before any job runs)
+		// concludes as "startup_failure" and produces NO check runs — it is invisible to
+		// both the statuses and check-runs APIs. Treat it as a hard failure.
+		case "startup_failure":
+			return "failure";
+		case "stale":
+			return "pending";
+		default:
+			return "pending";
+	}
+}
+
 export async function computeAllBuildsState(
 	token: string,
 	owner: string,
@@ -49,13 +73,21 @@ export async function computeAllBuildsState(
 		return { state: "failure", description: "One or more builds failed" };
 	}
 
-	// Fetch both statuses and check runs
+	// Fetch statuses, check runs, and workflow runs.
 	let statuses;
 	let checkRuns;
+	let workflowRuns;
 	try {
-		[statuses, checkRuns] = await Promise.all([
+		[statuses, checkRuns, workflowRuns] = await Promise.all([
 			listStatuses(token, owner, repo, sha),
 			listCheckRuns(token, owner, repo, sha),
+			// Workflow runs surface workflow-level failures that create NO check runs — most
+			// importantly "startup_failure" (e.g. invalid workflow YAML). Such a failure is
+			// invisible to both the statuses and check-runs APIs, so without this an all-builds
+			// status could go green even though a workflow never started. Best-effort: degrade
+			// to [] (rather than failing the whole aggregation) if the app lacks the actions:read
+			// permission or Actions is disabled on the repo.
+			listWorkflowRuns(token, owner, repo, sha).catch(() => [] as WorkflowRun[]),
 		]);
 	} catch {
 		return { state: "error", description: "Failed to fetch commit statuses" };
@@ -83,6 +115,21 @@ export async function computeAllBuildsState(
 		if (matchesIgnorePattern(cr.name, ignorePatterns)) continue;
 		seenNames.add(cr.name);
 		entries.push({ state: mapCheckRunState(cr.status, cr.conclusion) });
+	}
+
+	// Fold in workflow-level failures (e.g. startup_failure from invalid YAML) that produce no
+	// check runs. Deduplicate by workflow name — the API returns newest first, matching the
+	// check-run dedup above. Passing/pending workflows are already represented by their own check
+	// runs, so we only add entries for workflow runs that conclude in failure.
+	const seenWorkflows = new Set<string>();
+	for (const run of workflowRuns) {
+		const name = run.name ?? "";
+		if (seenWorkflows.has(name)) continue;
+		if (matchesIgnorePattern(name, ignorePatterns)) continue;
+		seenWorkflows.add(name);
+		if (mapWorkflowRunState(run.status, run.conclusion) === "failure") {
+			entries.push({ state: "failure" });
+		}
 	}
 
 	// No other relevant entries

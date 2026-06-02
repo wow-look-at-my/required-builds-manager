@@ -5,17 +5,20 @@ import * as github from "../src/github";
 vi.mock("../src/github", () => ({
 	listStatuses: vi.fn(),
 	listCheckRuns: vi.fn(),
+	listWorkflowRuns: vi.fn(),
 	createStatus: vi.fn(),
 }));
 
 const mockedListStatuses = vi.mocked(github.listStatuses);
 const mockedListCheckRuns = vi.mocked(github.listCheckRuns);
+const mockedListWorkflowRuns = vi.mocked(github.listWorkflowRuns);
 
 describe("computeAllBuildsState", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		mockedListStatuses.mockResolvedValue([]);
 		mockedListCheckRuns.mockResolvedValue([]);
+		mockedListWorkflowRuns.mockResolvedValue([]);
 	});
 
 	it("failure fast path — no API call needed", async () => {
@@ -428,6 +431,106 @@ describe("computeAllBuildsState", () => {
 
 			expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 			expect(mockedListStatuses).not.toHaveBeenCalled();
+		});
+	});
+
+	// Workflow run tests — startup_failure (e.g. invalid YAML) produces no statuses or
+	// check runs, so it can only be detected via the workflow runs API.
+
+	describe("workflow runs", () => {
+		it("startup_failure blocks an otherwise-passing commit", async () => {
+			// A passing check run from another workflow arrives later; without the workflow-run
+			// lookup this would flip all-builds green despite the broken workflow.
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "success" },
+			]);
+			mockedListWorkflowRuns.mockResolvedValue([
+				{ name: "CI", status: "completed", conclusion: "startup_failure", head_sha: "abc123" },
+			]);
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
+
+			expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+		});
+
+		it("startup_failure with no other builds — pure invalid-YAML commit", async () => {
+			mockedListWorkflowRuns.mockResolvedValue([
+				{ name: "CI", status: "completed", conclusion: "startup_failure", head_sha: "abc123" },
+			]);
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "CI");
+
+			expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+		});
+
+		it("successful workflow runs do not block (covered by their check runs)", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "success" },
+			]);
+			mockedListWorkflowRuns.mockResolvedValue([
+				{ name: "CI", status: "completed", conclusion: "success", head_sha: "abc123" },
+			]);
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
+
+			expect(result).toEqual({ state: "success", description: "All builds passed" });
+		});
+
+		it("in-progress workflow runs do not add pending (covered by their check runs)", async () => {
+			mockedListWorkflowRuns.mockResolvedValue([
+				{ name: "CI", status: "in_progress", conclusion: null, head_sha: "abc123" },
+			]);
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "lint");
+
+			expect(result).toEqual({ state: "success", description: "All builds passed" });
+		});
+
+		it("deduplicates workflow runs by name — newest (first) wins, so a later fix clears it", async () => {
+			mockedListWorkflowRuns.mockResolvedValue([
+				{ name: "CI", status: "completed", conclusion: "success", head_sha: "abc123" }, // newer
+				{ name: "CI", status: "completed", conclusion: "startup_failure", head_sha: "abc123" }, // older
+			]);
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "lint");
+
+			expect(result).toEqual({ state: "success", description: "All builds passed" });
+		});
+
+		it("ignored workflow names are excluded", async () => {
+			const config = { context: "all-builds", ignore: ["CodeQL"] };
+			mockedListWorkflowRuns.mockResolvedValue([
+				{ name: "CodeQL", status: "completed", conclusion: "startup_failure", head_sha: "abc123" },
+			]);
+
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "success", "build", undefined, config,
+			);
+
+			expect(result).toEqual({ state: "success", description: "All builds passed" });
+		});
+
+		it("degrades gracefully when workflow runs cannot be fetched", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "success" },
+			]);
+			mockedListWorkflowRuns.mockRejectedValue(new Error("403 Forbidden"));
+
+			// A workflow-runs fetch failure must NOT fail the whole aggregation.
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
+
+			expect(result).toEqual({ state: "success", description: "All builds passed" });
+		});
+
+		it("a failed status still fails even if workflow runs fetch errors", async () => {
+			mockedListStatuses.mockResolvedValue([
+				{ state: "failure", context: "ci", id: 1 },
+			]);
+			mockedListWorkflowRuns.mockRejectedValue(new Error("403 Forbidden"));
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "lint");
+
+			expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
 		});
 	});
 });
