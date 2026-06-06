@@ -5,6 +5,14 @@
 	"kv_namespaces": [
 		{ "binding": "TOKEN_CACHE", "id": "956ebbd72c98416d80af29f302e5e8ad" }
 	],
+	"durable_objects": {
+		"bindings": [
+			{ "name": "CHECK_RUN_PUBLISHER", "class_name": "CheckRunPublisher" }
+		]
+	},
+	"migrations": [
+		{ "tag": "v1", "new_sqlite_classes": ["CheckRunPublisher"] }
+	],
 	"observability": {
 		"traces": {
 			"enabled": true,

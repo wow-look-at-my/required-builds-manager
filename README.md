@@ -1,21 +1,33 @@
 # Required Builds Manager
 
-A Cloudflare Worker that aggregates GitHub commit statuses and check runs into a single combined "all-builds" status. Install it as a GitHub App to get a unified pass/fail signal across all your CI checks.
+A Cloudflare Worker that aggregates GitHub commit statuses, check runs, and workflow runs into a single combined "all-builds" check run. Install it as a GitHub App to get a unified pass/fail signal across all your CI checks.
 
 ## How It Works
 
-When any CI system reports a status or check run on a commit, this worker:
+When any CI system reports a status, check run, or workflow run on a commit, this worker:
 
 1. Receives the webhook event from GitHub
-2. Fetches all statuses and check runs for that commit
-3. Deduplicates them (by context for statuses, by name for check runs)
+2. Fetches all statuses, check runs, and workflow runs for that commit
+3. Deduplicates them (by context for statuses, by name for check runs and workflow runs)
 4. Computes an aggregate state using a low-water-mark algorithm:
    - **failure** if any build failed
    - **pending** if any build is still running
    - **success** only if all builds passed
-5. Posts the result back as an "all-builds" commit status
+5. Publishes the result as an "all-builds" check run
 
-This lets you use a single required status check (`all-builds`) in your branch protection rules instead of listing every individual CI job.
+### Detailed failure reporting
+
+The check run doesn't just say pass/fail — its title names the specific build that failed (e.g. `lint failed: 3 errors`, or `2 builds failed`), and its Markdown summary lists every build grouped into **Failed / In progress / Passed**, with each failing build's error detail and a link to where the full error renders. This is why the worker publishes a **check run** rather than a commit status: a status `description` is capped at ~140 characters, while a check run's `output.summary` holds a full Markdown breakdown.
+
+For a `startup_failure` (invalid workflow YAML), GitHub exposes the validation message only in its web UI, not via the API — so the summary names the broken workflow and links to the run, where the full "Invalid workflow file..." text is shown.
+
+The worker updates a **single** `all-builds` check run in place as builds report (rather than stacking a new check run on every event), so each commit shows one entry whose state changes over time. To keep this exact even when many builds finish at once (e.g. a large matrix), publishing for a given commit is serialized through a per-commit Durable Object — so concurrent events can't race into duplicate check runs. Every individual workflow job already appears as its own check run, so the breakdown covers per-job state without subscribing to `workflow_job` events.
+
+### Catching workflow startup failures
+
+When a workflow's YAML is invalid (or it otherwise fails before any job runs), GitHub records it as a `startup_failure` workflow run that produces **zero check runs and zero statuses** — invisible to the statuses and check-runs APIs. The worker also listens for `workflow_run` events and folds any `startup_failure` into the aggregate, so a broken workflow blocks the `all-builds` check instead of silently passing. (This requires the `Actions` read permission; if it's missing, the worker degrades gracefully and simply skips this check.)
+
+This lets you use a single required check (`all-builds`) in your branch protection rules instead of listing every individual CI job.
 
 ## Per-Repo Configuration
 
@@ -40,8 +52,10 @@ If no config file exists, the app uses `all-builds` as the context with no ignor
 ### Prerequisites
 
 - A [GitHub App](https://docs.github.com/en/apps/creating-github-apps) with:
-  - **Webhook events**: `Status`, `Check run`
-  - **Permissions**: `Commit statuses` (read & write), `Checks` (read), `Contents` (read)
+  - **Webhook events**: `Status`, `Check run`, `Workflow run`
+  - **Permissions**: `Checks` (read & write), `Commit statuses` (read), `Actions` (read), `Contents` (read)
+
+  > **Note:** the worker publishes its combined result as a **check run**, so it needs `Checks: write`. If you are upgrading from a version that published a commit status, bump the App's `Checks` permission from read to read & write — GitHub will prompt each installation to approve the new permission before the worker can post.
 - A [Cloudflare Workers](https://workers.cloudflare.com/) account
 
 ### Configuration
@@ -67,7 +81,7 @@ npx tsc --noEmit    # Type-check
 
 ### Tech Stack
 
-- **Runtime**: [Cloudflare Workers](https://workers.cloudflare.com/)
+- **Runtime**: [Cloudflare Workers](https://workers.cloudflare.com/) + a [Durable Object](https://developers.cloudflare.com/durable-objects/) (per-commit publish serialization)
 - **Language**: TypeScript (strict mode)
 - **Testing**: [Vitest](https://vitest.dev/) with [@cloudflare/vitest-pool-workers](https://developers.cloudflare.com/workers/testing/vitest-integration/)
 
@@ -75,12 +89,13 @@ npx tsc --noEmit    # Type-check
 
 ```
 src/
-├── index.ts       # Worker entry point and webhook handler
-├── aggregate.ts   # Build state aggregation logic
-├── auth.ts        # GitHub App authentication (JWT, installation tokens)
-├── config.ts      # Per-repo YAML config loading (with org fallback)
-├── github.ts      # GitHub API client (statuses, check runs)
-└── verify.ts      # Webhook signature verification
+├── index.ts               # Worker entry point and webhook handler
+├── aggregate.ts           # Build state aggregation + Markdown breakdown
+├── check-run-publisher.ts # Durable Object that serializes publishing per commit
+├── auth.ts                # GitHub App authentication (JWT, installation tokens)
+├── config.ts              # Per-repo YAML config loading (with org fallback)
+├── github.ts              # GitHub API client (statuses, check runs, workflow runs)
+└── verify.ts              # Webhook signature verification
 ```
 
 ## Deployment
