@@ -1,20 +1,27 @@
 import { verifySignature } from "./verify";
-import { computeAllBuildsState } from "./aggregate";
-import { createStatus } from "./github";
+import { computeAllBuildsState, type AggregateResult, type IncomingDetail } from "./aggregate";
+import { publishViaCoordinator, type CheckRunPublisher } from "./check-run-publisher";
 import { getInstallationToken } from "./auth";
 import { getRepoConfig } from "./config";
+
+// The Durable Object class must be exported from the Worker's entry module so the runtime can
+// instantiate it (see the durable_objects binding in wrangler.jsonc).
+export { CheckRunPublisher } from "./check-run-publisher";
 
 interface Env {
 	GITHUB_APP_ID: string;
 	GITHUB_APP_PRIVATE_KEY: string;
 	WEBHOOK_SECRET: string;
 	TOKEN_CACHE?: KVNamespace;
+	CHECK_RUN_PUBLISHER: DurableObjectNamespace<CheckRunPublisher>;
 }
 
 interface StatusEvent {
 	state: string;
 	context: string;
 	sha: string;
+	description: string | null;
+	target_url: string | null;
 	repository: {
 		full_name: string;
 	};
@@ -30,6 +37,10 @@ interface CheckRunEvent {
 		status: string;
 		conclusion: string | null;
 		head_sha: string;
+		output?: { title: string | null; summary: string | null };
+		details_url?: string | null;
+		html_url?: string | null;
+		app?: { id: number };
 	};
 	repository: {
 		full_name: string;
@@ -46,6 +57,7 @@ interface WorkflowRunEvent {
 		status: string;
 		conclusion: string | null;
 		head_sha: string;
+		html_url?: string | null;
 	};
 	repository: {
 		full_name: string;
@@ -99,6 +111,18 @@ function mapWorkflowRunState(status: string, conclusion: string | null): string 
 	}
 }
 
+// Maps the aggregate's logical state onto a check run's status + conclusion. A pending aggregate is
+// an in-progress run (no conclusion yet); everything else is a completed run. An internal "error"
+// blocks (conclusion "failure") just as the old error status did.
+function toCheckRunResult(state: AggregateResult["state"]): {
+	status: "in_progress" | "completed";
+	conclusion: string | null;
+} {
+	if (state === "pending") return { status: "in_progress", conclusion: null };
+	if (state === "success") return { status: "completed", conclusion: "success" };
+	return { status: "completed", conclusion: "failure" };
+}
+
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		if (request.method !== "POST") {
@@ -131,6 +155,8 @@ export default {
 		let incomingContext: string;
 		let fullName: string;
 		let installationId: number | undefined;
+		let incomingAppId: number | undefined;
+		const incoming: IncomingDetail = {};
 
 		if (event === "status") {
 			const payload: StatusEvent = JSON.parse(body);
@@ -139,6 +165,9 @@ export default {
 			incomingContext = payload.context;
 			fullName = payload.repository.full_name;
 			installationId = payload.installation?.id;
+			incoming.kind = "status";
+			incoming.detail = payload.description ?? undefined;
+			incoming.url = payload.target_url ?? undefined;
 		} else if (event === "check_run") {
 			const payload: CheckRunEvent = JSON.parse(body);
 			sha = payload.check_run.head_sha;
@@ -146,6 +175,10 @@ export default {
 			incomingContext = payload.check_run.name;
 			fullName = payload.repository.full_name;
 			installationId = payload.installation?.id;
+			incomingAppId = payload.check_run.app?.id;
+			incoming.kind = "check";
+			incoming.detail = payload.check_run.output?.title ?? undefined;
+			incoming.url = payload.check_run.details_url ?? payload.check_run.html_url ?? undefined;
 		} else {
 			const payload: WorkflowRunEvent = JSON.parse(body);
 			sha = payload.workflow_run.head_sha;
@@ -153,6 +186,9 @@ export default {
 			incomingContext = payload.workflow_run.name ?? "";
 			fullName = payload.repository.full_name;
 			installationId = payload.installation?.id;
+			incoming.kind = "workflow";
+			incoming.detail = payload.workflow_run.conclusion ?? undefined;
+			incoming.url = payload.workflow_run.html_url ?? undefined;
 		}
 
 		if (!installationId) {
@@ -166,6 +202,12 @@ export default {
 		const appId = parseInt(env.GITHUB_APP_ID, 10);
 		if (!Number.isInteger(appId) || isNaN(appId)) {
 			return new Response("Server misconfigured: GITHUB_APP_ID must be a valid integer", { status: 500 });
+		}
+
+		// Prevent infinite loop — our own combined check run fires a check_run event. Skip it by
+		// app.id (matching how aggregation filters our own check runs out of the listing).
+		if (event === "check_run" && incomingAppId === appId) {
+			return new Response("Ignored own check run", { status: 200 });
 		}
 
 		let token: string;
@@ -186,7 +228,8 @@ export default {
 			return new Response(`Failed to fetch config: ${msg}`, { status: 502 });
 		}
 
-		// Prevent infinite loop — skip events from our own status context
+		// Prevent infinite loop — skip events from our own combined context (a leftover status, or
+		// a foreign check run named the same is handled separately during aggregation).
 		if (event === "status" && incomingContext === config.context) {
 			return new Response(`Ignored ${config.context} context`, { status: 200 });
 		}
@@ -200,24 +243,32 @@ export default {
 			incomingContext,
 			appId,
 			config,
+			incoming,
 		);
 
+		const { status, conclusion } = toCheckRunResult(result.state);
+
 		try {
-			await createStatus(
+			// Route through the per-commit Durable Object so simultaneous build events serialize and
+			// produce a single "all-builds" check run rather than duplicates.
+			await publishViaCoordinator(
+				env.CHECK_RUN_PUBLISHER,
 				token,
 				owner,
 				repo,
 				sha,
-				result.state,
 				config.context,
-				result.description,
+				status,
+				conclusion,
+				{ title: result.title, summary: result.summary },
+				appId,
 			);
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : "Unknown error";
-			return new Response(`Failed to create status: ${msg}`, { status: 502 });
+			return new Response(`Failed to publish check run: ${msg}`, { status: 502 });
 		}
 
-		return new Response(JSON.stringify(result), {
+		return new Response(JSON.stringify({ state: result.state, title: result.title }), {
 			status: 200,
 			headers: { "Content-Type": "application/json" },
 		});

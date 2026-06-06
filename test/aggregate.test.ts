@@ -6,7 +6,7 @@ vi.mock("../src/github", () => ({
 	listStatuses: vi.fn(),
 	listCheckRuns: vi.fn(),
 	listWorkflowRuns: vi.fn(),
-	createStatus: vi.fn(),
+	createCheckRun: vi.fn(),
 }));
 
 const mockedListStatuses = vi.mocked(github.listStatuses);
@@ -21,20 +21,23 @@ describe("computeAllBuildsState", () => {
 		mockedListWorkflowRuns.mockResolvedValue([]);
 	});
 
-	it("failure fast path — no API call needed", async () => {
+	// An incoming failure no longer short-circuits — we always aggregate so the breakdown is
+	// complete — but the incoming build is folded in so the result reflects it even under API lag.
+	it("incoming failure aggregates and names the failing build", async () => {
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "failure", "ci/tests");
 
-		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
-		expect(mockedListStatuses).not.toHaveBeenCalled();
-		expect(mockedListCheckRuns).not.toHaveBeenCalled();
+		expect(result.state).toBe("failure");
+		expect(result.title).toBe("ci/tests failed");
+		expect(result.summary).toContain("Failed (1)");
+		expect(result.summary).toContain("`ci/tests`");
+		expect(mockedListStatuses).toHaveBeenCalled();
 	});
 
-	it("error fast path — no API call needed", async () => {
+	it("incoming error maps to failure and names the build", async () => {
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "error", "ci/tests");
 
-		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
-		expect(mockedListStatuses).not.toHaveBeenCalled();
-		expect(mockedListCheckRuns).not.toHaveBeenCalled();
+		expect(result.state).toBe("failure");
+		expect(result.title).toBe("ci/tests failed");
 	});
 
 	it("all statuses success", async () => {
@@ -45,10 +48,12 @@ describe("computeAllBuildsState", () => {
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
-		expect(result).toEqual({ state: "success", description: "All builds passed" });
+		expect(result.state).toBe("success");
+		expect(result.title).toBe("All builds passed");
+		expect(result.summary).toContain("Passed");
 	});
 
-	it("mixed pending statuses", async () => {
+	it("mixed pending statuses — names the pending build", async () => {
 		mockedListStatuses.mockResolvedValue([
 			{ state: "success", context: "ci", id: 1 },
 			{ state: "pending", context: "lint", id: 2 },
@@ -56,10 +61,12 @@ describe("computeAllBuildsState", () => {
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
-		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
+		expect(result.state).toBe("pending");
+		expect(result.title).toBe("lint in progress");
+		expect(result.summary).toContain("In progress (1)");
 	});
 
-	it("mixed failure in existing statuses", async () => {
+	it("mixed failure in existing statuses — names the failing build", async () => {
 		mockedListStatuses.mockResolvedValue([
 			{ state: "success", context: "ci", id: 1 },
 			{ state: "failure", context: "lint", id: 2 },
@@ -67,17 +74,32 @@ describe("computeAllBuildsState", () => {
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
-		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+		expect(result.state).toBe("failure");
+		expect(result.title).toBe("lint failed");
 	});
 
-	it("pending incoming, no failures in existing", async () => {
+	it("includes a status description as the failure detail", async () => {
+		mockedListStatuses.mockResolvedValue([
+			{ state: "failure", context: "ci/tests", id: 1, description: "3 tests failed", target_url: "https://ci.example/run/1" },
+		]);
+
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+
+		expect(result.state).toBe("failure");
+		expect(result.title).toBe("ci/tests failed: 3 tests failed");
+		expect(result.summary).toContain("3 tests failed");
+		expect(result.summary).toContain("([details](https://ci.example/run/1))");
+	});
+
+	it("pending incoming, no failures in existing — incoming pulls state to pending", async () => {
 		mockedListStatuses.mockResolvedValue([
 			{ state: "success", context: "ci", id: 1 },
 		]);
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "ci");
 
-		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
+		expect(result.state).toBe("pending");
+		expect(result.title).toBe("ci in progress");
 	});
 
 	it("pending incoming, with failure in existing", async () => {
@@ -87,7 +109,8 @@ describe("computeAllBuildsState", () => {
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "lint");
 
-		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+		expect(result.state).toBe("failure");
+		expect(result.title).toBe("ci failed");
 	});
 
 	it("deduplicates statuses by context — first (latest) wins", async () => {
@@ -98,19 +121,21 @@ describe("computeAllBuildsState", () => {
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
-		expect(result).toEqual({ state: "success", description: "All builds passed" });
+		expect(result.state).toBe("success");
 	});
 
 	it("no other statuses or check runs — success incoming", async () => {
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
-		expect(result).toEqual({ state: "success", description: "All builds passed" });
+		expect(result.state).toBe("success");
+		expect(result.title).toBe("All builds passed");
 	});
 
 	it("no other statuses or check runs — pending incoming", async () => {
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "ci");
 
-		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
+		expect(result.state).toBe("pending");
+		expect(result.title).toBe("ci in progress");
 	});
 
 	it("filters out all-builds status context", async () => {
@@ -121,7 +146,7 @@ describe("computeAllBuildsState", () => {
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
-		expect(result).toEqual({ state: "success", description: "All builds passed" });
+		expect(result.state).toBe("success");
 	});
 
 	it("filters out custom context name from config", async () => {
@@ -133,7 +158,7 @@ describe("computeAllBuildsState", () => {
 		const config = { context: "custom-builds", ignore: [] };
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci", undefined, config);
 
-		expect(result).toEqual({ state: "success", description: "All builds passed" });
+		expect(result.state).toBe("success");
 	});
 
 	it("returns error when API fetch fails", async () => {
@@ -141,7 +166,8 @@ describe("computeAllBuildsState", () => {
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
-		expect(result).toEqual({ state: "error", description: "Failed to fetch commit statuses" });
+		expect(result.state).toBe("error");
+		expect(result.title).toBe("Could not aggregate builds");
 	});
 
 	// Check run tests
@@ -152,9 +178,9 @@ describe("computeAllBuildsState", () => {
 			{ name: "test", status: "completed", conclusion: "success" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
 
-		expect(result).toEqual({ state: "success", description: "All builds passed" });
+		expect(result.state).toBe("success");
 	});
 
 	it("check run in_progress maps to pending", async () => {
@@ -162,9 +188,10 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "in_progress", conclusion: null },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "build");
 
-		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
+		expect(result.state).toBe("pending");
+		expect(result.title).toBe("build in progress");
 	});
 
 	it("check run queued maps to pending", async () => {
@@ -172,9 +199,9 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "queued", conclusion: null },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "build");
 
-		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
+		expect(result.state).toBe("pending");
 	});
 
 	it("check run failure conclusion maps to failure", async () => {
@@ -182,9 +209,29 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "completed", conclusion: "failure" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
 
-		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+		expect(result.state).toBe("failure");
+		expect(result.title).toBe("build failed");
+	});
+
+	it("includes a check run output title as the failure detail", async () => {
+		mockedListCheckRuns.mockResolvedValue([
+			{
+				name: "build",
+				status: "completed",
+				conclusion: "failure",
+				output: { title: "compile error in main.ts", summary: "..." },
+				details_url: "https://gh.example/runs/9",
+			},
+		]);
+
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+
+		expect(result.state).toBe("failure");
+		expect(result.title).toBe("build failed: compile error in main.ts");
+		expect(result.summary).toContain("compile error in main.ts");
+		expect(result.summary).toContain("([details](https://gh.example/runs/9))");
 	});
 
 	it("check run timed_out maps to failure", async () => {
@@ -192,9 +239,9 @@ describe("computeAllBuildsState", () => {
 			{ name: "deploy", status: "completed", conclusion: "timed_out" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
 
-		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+		expect(result.state).toBe("failure");
 	});
 
 	it("check run cancelled maps to failure", async () => {
@@ -202,9 +249,9 @@ describe("computeAllBuildsState", () => {
 			{ name: "deploy", status: "completed", conclusion: "cancelled" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
 
-		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+		expect(result.state).toBe("failure");
 	});
 
 	it("check run neutral maps to success (non-blocking)", async () => {
@@ -212,9 +259,9 @@ describe("computeAllBuildsState", () => {
 			{ name: "optional", status: "completed", conclusion: "neutral" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "optional");
 
-		expect(result).toEqual({ state: "success", description: "All builds passed" });
+		expect(result.state).toBe("success");
 	});
 
 	it("check run skipped maps to success (non-blocking)", async () => {
@@ -222,9 +269,9 @@ describe("computeAllBuildsState", () => {
 			{ name: "optional", status: "completed", conclusion: "skipped" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "optional");
 
-		expect(result).toEqual({ state: "success", description: "All builds passed" });
+		expect(result.state).toBe("success");
 	});
 
 	it("check run stale maps to pending", async () => {
@@ -232,9 +279,9 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "completed", conclusion: "stale" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "build");
 
-		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
+		expect(result.state).toBe("pending");
 	});
 
 	it("does not filter check runs by name — filters by app.id instead", async () => {
@@ -244,8 +291,8 @@ describe("computeAllBuildsState", () => {
 		]);
 
 		// Without appId, the all-builds check run is included and causes failure
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
-		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
+		expect(result.state).toBe("failure");
 	});
 
 	it("filters out check runs from our own app by app.id", async () => {
@@ -255,8 +302,8 @@ describe("computeAllBuildsState", () => {
 		]);
 
 		// With matching appId, the check run from our app is excluded
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci", 99999);
-		expect(result).toEqual({ state: "success", description: "All builds passed" });
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build", 99999);
+		expect(result.state).toBe("success");
 	});
 
 	it("does not filter check runs from a different app", async () => {
@@ -266,8 +313,8 @@ describe("computeAllBuildsState", () => {
 		]);
 
 		// app.id doesn't match — check run is included
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci", 99999);
-		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build", 99999);
+		expect(result.state).toBe("failure");
 	});
 
 	it("deduplicates check runs by name — first wins", async () => {
@@ -276,9 +323,9 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "completed", conclusion: "failure" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
 
-		expect(result).toEqual({ state: "success", description: "All builds passed" });
+		expect(result.state).toBe("success");
 	});
 
 	// Combined check runs + statuses
@@ -293,7 +340,7 @@ describe("computeAllBuildsState", () => {
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci/lint");
 
-		expect(result).toEqual({ state: "success", description: "All builds passed" });
+		expect(result.state).toBe("success");
 	});
 
 	it("combines statuses and check runs — check run pending pulls to pending", async () => {
@@ -306,7 +353,7 @@ describe("computeAllBuildsState", () => {
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci/lint");
 
-		expect(result).toEqual({ state: "pending", description: "Builds in progress" });
+		expect(result.state).toBe("pending");
 	});
 
 	it("combines statuses and check runs — status failure wins", async () => {
@@ -317,9 +364,10 @@ describe("computeAllBuildsState", () => {
 			{ name: "build", status: "completed", conclusion: "success" },
 		]);
 
-		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci/lint");
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
 
-		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+		expect(result.state).toBe("failure");
+		expect(result.title).toBe("ci/lint failed");
 	});
 
 	it("combines statuses and check runs — check run failure wins", async () => {
@@ -332,7 +380,25 @@ describe("computeAllBuildsState", () => {
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci/lint");
 
-		expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+		expect(result.state).toBe("failure");
+		expect(result.title).toBe("build failed");
+	});
+
+	it("lists multiple failing builds and counts them in the title", async () => {
+		mockedListStatuses.mockResolvedValue([
+			{ state: "failure", context: "lint", id: 1 },
+		]);
+		mockedListCheckRuns.mockResolvedValue([
+			{ name: "build", status: "completed", conclusion: "failure" },
+		]);
+
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+
+		expect(result.state).toBe("failure");
+		expect(result.title).toBe("2 builds failed");
+		expect(result.summary).toContain("Failed (2)");
+		expect(result.summary).toContain("`lint`");
+		expect(result.summary).toContain("`build`");
 	});
 
 	it("returns error when check runs fetch fails", async () => {
@@ -340,7 +406,32 @@ describe("computeAllBuildsState", () => {
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
-		expect(result).toEqual({ state: "error", description: "Failed to fetch commit statuses" });
+		expect(result.state).toBe("error");
+	});
+
+	// Incoming detail (from the webhook event) is used when the build is not yet in the listing.
+
+	it("uses incoming detail when the failing build is not yet listed (API lag)", async () => {
+		const result = await computeAllBuildsState(
+			"token", "owner", "repo", "abc123", "failure", "deploy", undefined, undefined,
+			{ kind: "check", detail: "exit code 1", url: "https://gh.example/runs/42" },
+		);
+
+		expect(result.state).toBe("failure");
+		expect(result.title).toBe("deploy failed: exit code 1");
+		expect(result.summary).toContain("(check run)");
+		expect(result.summary).toContain("([details](https://gh.example/runs/42))");
+	});
+
+	it("sanitizes backticks in build names", async () => {
+		mockedListStatuses.mockResolvedValue([
+			{ state: "failure", context: "we`ird", id: 1 },
+		]);
+
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+
+		expect(result.summary).toContain("`we'ird`");
+		expect(result.summary).not.toContain("we`ird");
 	});
 
 	// Ignore pattern tests
@@ -358,7 +449,7 @@ describe("computeAllBuildsState", () => {
 				"token", "owner", "repo", "abc123", "success", "ci", undefined, configWithIgnore,
 			);
 
-			expect(result).toEqual({ state: "success", description: "All builds passed" });
+			expect(result.state).toBe("success");
 		});
 
 		it("excludes ignored check runs from aggregation", async () => {
@@ -368,13 +459,13 @@ describe("computeAllBuildsState", () => {
 			]);
 
 			const result = await computeAllBuildsState(
-				"token", "owner", "repo", "abc123", "success", "ci", undefined, configWithIgnore,
+				"token", "owner", "repo", "abc123", "success", "build", undefined, configWithIgnore,
 			);
 
-			expect(result).toEqual({ state: "success", description: "All builds passed" });
+			expect(result.state).toBe("success");
 		});
 
-		it("skips failure fast path when incoming context is ignored", async () => {
+		it("does not fold an ignored incoming failure", async () => {
 			mockedListStatuses.mockResolvedValue([
 				{ state: "success", context: "ci", id: 1 },
 			]);
@@ -383,8 +474,8 @@ describe("computeAllBuildsState", () => {
 				"token", "owner", "repo", "abc123", "failure", "codecov/project", undefined, configWithIgnore,
 			);
 
-			// Should NOT short-circuit to failure — codecov is ignored
-			expect(result).toEqual({ state: "success", description: "All builds passed" });
+			// Should NOT go to failure — codecov is ignored
+			expect(result.state).toBe("success");
 			expect(mockedListStatuses).toHaveBeenCalled();
 		});
 
@@ -397,7 +488,7 @@ describe("computeAllBuildsState", () => {
 				"token", "owner", "repo", "abc123", "pending", "codecov/project", undefined, configWithIgnore,
 			);
 
-			expect(result).toEqual({ state: "success", description: "All builds passed" });
+			expect(result.state).toBe("success");
 		});
 
 		it("returns success when all entries are ignored and no relevant builds exist", async () => {
@@ -409,7 +500,8 @@ describe("computeAllBuildsState", () => {
 				"token", "owner", "repo", "abc123", "failure", "codecov/project", undefined, configWithIgnore,
 			);
 
-			expect(result).toEqual({ state: "success", description: "All builds passed" });
+			expect(result.state).toBe("success");
+			expect(result.summary).toContain("No builds");
 		});
 
 		it("non-matching patterns do not affect aggregation", async () => {
@@ -421,16 +513,16 @@ describe("computeAllBuildsState", () => {
 				"token", "owner", "repo", "abc123", "success", "ci/tests", undefined, configWithIgnore,
 			);
 
-			expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+			expect(result.state).toBe("failure");
 		});
 
-		it("still applies failure fast path for non-ignored incoming", async () => {
+		it("aggregates (no short-circuit) for a non-ignored incoming failure", async () => {
 			const result = await computeAllBuildsState(
 				"token", "owner", "repo", "abc123", "failure", "ci/tests", undefined, configWithIgnore,
 			);
 
-			expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
-			expect(mockedListStatuses).not.toHaveBeenCalled();
+			expect(result.state).toBe("failure");
+			expect(mockedListStatuses).toHaveBeenCalled();
 		});
 	});
 
@@ -438,19 +530,23 @@ describe("computeAllBuildsState", () => {
 	// check runs, so it can only be detected via the workflow runs API.
 
 	describe("workflow runs", () => {
-		it("startup_failure blocks an otherwise-passing commit", async () => {
+		it("startup_failure blocks an otherwise-passing commit and names the workflow", async () => {
 			// A passing check run from another workflow arrives later; without the workflow-run
 			// lookup this would flip all-builds green despite the broken workflow.
 			mockedListCheckRuns.mockResolvedValue([
 				{ name: "build", status: "completed", conclusion: "success" },
 			]);
 			mockedListWorkflowRuns.mockResolvedValue([
-				{ name: "CI", status: "completed", conclusion: "startup_failure", head_sha: "abc123" },
+				{ name: "CI", status: "completed", conclusion: "startup_failure", head_sha: "abc123", html_url: "https://gh.example/run/7" },
 			]);
 
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
 
-			expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+			expect(result.state).toBe("failure");
+			expect(result.title).toBe("CI failed: startup_failure");
+			expect(result.summary).toContain("startup_failure");
+			expect(result.summary).toContain("(workflow)");
+			expect(result.summary).toContain("([details](https://gh.example/run/7))");
 		});
 
 		it("startup_failure with no other builds — pure invalid-YAML commit", async () => {
@@ -460,7 +556,7 @@ describe("computeAllBuildsState", () => {
 
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "CI");
 
-			expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+			expect(result.state).toBe("failure");
 		});
 
 		it("successful workflow runs do not block (covered by their check runs)", async () => {
@@ -473,7 +569,7 @@ describe("computeAllBuildsState", () => {
 
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
 
-			expect(result).toEqual({ state: "success", description: "All builds passed" });
+			expect(result.state).toBe("success");
 		});
 
 		it("in-progress workflow runs do not add pending (covered by their check runs)", async () => {
@@ -483,7 +579,7 @@ describe("computeAllBuildsState", () => {
 
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "lint");
 
-			expect(result).toEqual({ state: "success", description: "All builds passed" });
+			expect(result.state).toBe("success");
 		});
 
 		it("deduplicates workflow runs by name — newest (first) wins, so a later fix clears it", async () => {
@@ -494,7 +590,7 @@ describe("computeAllBuildsState", () => {
 
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "lint");
 
-			expect(result).toEqual({ state: "success", description: "All builds passed" });
+			expect(result.state).toBe("success");
 		});
 
 		it("ignored workflow names are excluded", async () => {
@@ -507,7 +603,7 @@ describe("computeAllBuildsState", () => {
 				"token", "owner", "repo", "abc123", "success", "build", undefined, config,
 			);
 
-			expect(result).toEqual({ state: "success", description: "All builds passed" });
+			expect(result.state).toBe("success");
 		});
 
 		it("degrades gracefully when workflow runs cannot be fetched", async () => {
@@ -519,7 +615,7 @@ describe("computeAllBuildsState", () => {
 			// A workflow-runs fetch failure must NOT fail the whole aggregation.
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
 
-			expect(result).toEqual({ state: "success", description: "All builds passed" });
+			expect(result.state).toBe("success");
 		});
 
 		it("a failed status still fails even if workflow runs fetch errors", async () => {
@@ -530,7 +626,7 @@ describe("computeAllBuildsState", () => {
 
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "lint");
 
-			expect(result).toEqual({ state: "failure", description: "One or more builds failed" });
+			expect(result.state).toBe("failure");
 		});
 	});
 });
