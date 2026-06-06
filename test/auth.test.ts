@@ -122,6 +122,26 @@ describe("getInstallationToken", () => {
 		expect(token).toBe("ghs_fresh");
 	});
 
+	it("forceRefresh skips a valid cached token and mints a fresh one", async () => {
+		// A token minted before a permissions change is stale (GitHub bakes permissions in at mint
+		// time), so callers can force a brand-new token even when the cache looks valid.
+		tokenCache.set(12345, {
+			token: "ghs_stale_cached",
+			expiresAt: Math.floor(Date.now() / 1000) + 3600,
+		});
+
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: "/app/installations/12345/access_tokens", method: "POST" })
+			.reply(200, JSON.stringify({
+				token: "ghs_forced_fresh",
+				expires_at: new Date(Date.now() + 3600000).toISOString(),
+			}), { headers: { "content-type": "application/json" } });
+
+		const token = await getInstallationToken(env, 12345, undefined, true);
+		expect(token).toBe("ghs_forced_fresh");
+	});
+
 	it("throws on missing private key", async () => {
 		const badEnv = { GITHUB_APP_ID: "12345", GITHUB_APP_PRIVATE_KEY: "" };
 		await expect(getInstallationToken(badEnv, 12345)).rejects.toThrow("Missing GITHUB_APP_PRIVATE_KEY");

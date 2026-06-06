@@ -6,11 +6,13 @@ vi.mock("../src/github", () => ({
 	listStatuses: vi.fn(),
 	listCheckRuns: vi.fn(),
 	listWorkflowRuns: vi.fn(),
+	getWorkflowJob: vi.fn(),
 }));
 
 const mockedListStatuses = vi.mocked(github.listStatuses);
 const mockedListCheckRuns = vi.mocked(github.listCheckRuns);
 const mockedListWorkflowRuns = vi.mocked(github.listWorkflowRuns);
+const mockedGetWorkflowJob = vi.mocked(github.getWorkflowJob);
 
 describe("computeAllBuildsState", () => {
 	beforeEach(() => {
@@ -18,6 +20,8 @@ describe("computeAllBuildsState", () => {
 		mockedListStatuses.mockResolvedValue([]);
 		mockedListCheckRuns.mockResolvedValue([]);
 		mockedListWorkflowRuns.mockResolvedValue([]);
+		// Default: no step detail. Per-step tests override this.
+		mockedGetWorkflowJob.mockResolvedValue(null);
 	});
 
 	// An incoming failure no longer short-circuits — we always aggregate so the breakdown is
@@ -93,18 +97,21 @@ describe("computeAllBuildsState", () => {
 		expect(result.summary).toContain("[ci/tests](<https://ci.example/run/1>)");
 	});
 
-	it("pending incoming, no failures in existing — incoming pulls state to pending", async () => {
+	it("pending incoming does NOT drag a build the listing shows as passed back to pending", async () => {
+		// The authoritative listing says ci passed. A pending incoming (e.g. a stale or out-of-order
+		// redelivery) must not pull all-builds back to "in progress" — that is exactly how check runs
+		// were getting wedged on "in progress" while every build was green.
 		mockedListStatuses.mockResolvedValue([
 			{ state: "success", context: "ci", id: 1 },
 		]);
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "ci");
 
-		expect(result.state).toBe("pending");
-		expect(result.title).toBe("0/1 builds passed");
+		expect(result.state).toBe("success");
+		expect(result.title).toBe("1/1 builds passed");
 	});
 
-	it("pending incoming, with failure in existing", async () => {
+	it("pending incoming is dropped, but an existing failure still fails", async () => {
 		mockedListStatuses.mockResolvedValue([
 			{ state: "failure", context: "ci", id: 1 },
 		]);
@@ -112,7 +119,8 @@ describe("computeAllBuildsState", () => {
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "lint");
 
 		expect(result.state).toBe("failure");
-		expect(result.title).toBe("1/2 builds failed");
+		// The pending "lint" incoming isn't folded, so it isn't counted: just the failing ci remains.
+		expect(result.title).toBe("1/1 builds failed");
 	});
 
 	it("deduplicates statuses by context — first (latest) wins", async () => {
@@ -134,11 +142,14 @@ describe("computeAllBuildsState", () => {
 		expect(result.title).toBe("1/1 builds passed");
 	});
 
-	it("no other statuses or check runs — pending incoming", async () => {
+	it("no other statuses or check runs — a bare pending incoming reflects the empty listing", async () => {
+		// A bare pending event invents nothing: the listing is authoritative, and a real pending build
+		// would already appear in it. Trusting the event here is what left all-builds stuck "in
+		// progress" after the build had finished.
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "ci");
 
-		expect(result.state).toBe("pending");
-		expect(result.title).toBe("0/1 builds passed");
+		expect(result.state).toBe("success");
+		expect(result.title).toBe("No builds reported yet");
 	});
 
 	it("filters out all-builds status context", async () => {
@@ -649,6 +660,148 @@ describe("computeAllBuildsState", () => {
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "lint");
 
 			expect(result.state).toBe("failure");
+		});
+	});
+
+	// Regression: an all-builds check run must never get wedged on "in progress" while every real
+	// build is green. This happened because a pending incoming event was folded into the aggregate —
+	// a pending workflow_run pushed a phantom row (passing/running workflows have no standalone row,
+	// only failing ones do), or a stale/out-of-order pending status/check_run dragged a passed row
+	// back down — and nothing re-aggregated to clear it.
+	describe("incoming pending events never wedge all-builds on in-progress", () => {
+		it("a pending workflow_run event does not add a phantom 'in progress' row (PR #179 repro)", async () => {
+			// Every real build for the commit has passed...
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "success" },
+				{ name: "deploy / preview", status: "completed", conclusion: "success" },
+			]);
+			mockedListWorkflowRuns.mockResolvedValue([
+				{ name: "Pages", status: "completed", conclusion: "success", head_sha: "abc123" },
+			]);
+
+			// ...but a late/out-of-order "Pages" workflow_run in_progress event is the last thing we
+			// process. It must NOT invent a pending workflow row, so all-builds stays green.
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "pending", "Pages", undefined, undefined,
+				{ kind: "workflow" },
+			);
+
+			expect(result.state).toBe("success");
+			expect(result.title).toBe("2/2 builds passed");
+		});
+
+		it("a stale pending check_run event does not pull a passed build back to pending", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "success" },
+			]);
+
+			// A redelivered "build" in_progress event arrives after build already passed.
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "pending", "build", undefined, undefined,
+				{ kind: "check" },
+			);
+
+			expect(result.state).toBe("success");
+		});
+
+		it("a pending workflow_run event with an empty listing invents nothing", async () => {
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "pending", "Pages", undefined, undefined,
+				{ kind: "workflow" },
+			);
+
+			expect(result.state).toBe("success");
+		});
+
+		it("STILL folds in an incoming failure the listing has not yet indexed (lag)", async () => {
+			// The failure path is the whole reason fold-in exists — it must keep working. Here a
+			// workflow startup_failure event arrives before listWorkflowRuns reports it.
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "failure", "CI", undefined, undefined,
+				{ kind: "workflow", detail: "startup_failure", url: "https://gh.example/run/9" },
+			);
+
+			expect(result.state).toBe("failure");
+			expect(result.title).toBe("1/1 builds failed");
+			expect(result.summary).toContain("startup_failure");
+		});
+	});
+
+	// Per-step breakdown: for a failed or in-progress Actions job, surface its individual steps so the
+	// summary shows exactly which step failed or is running.
+	describe("per-step breakdown for failed / in-progress jobs", () => {
+		const jobUrl = "https://github.com/o/r/actions/runs/123/job/456";
+
+		it("shows the individual steps of a failed job, flagging the failed step", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "failure", details_url: jobUrl },
+			]);
+			mockedGetWorkflowJob.mockResolvedValue({
+				steps: [
+					{ name: "Set up job", status: "completed", conclusion: "success", number: 1 },
+					{ name: "Run build", status: "completed", conclusion: "failure", number: 2 },
+					{ name: "Upload", status: "completed", conclusion: "skipped", number: 3 },
+				],
+			});
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+
+			expect(result.state).toBe("failure");
+			// The Actions job id is parsed from the check run URL.
+			expect(mockedGetWorkflowJob).toHaveBeenCalledWith("token", "owner", "repo", 456);
+			expect(result.summary).toContain("Set up job");
+			expect(result.summary).toContain(":x: Run build");
+		});
+
+		it("shows the currently running step of an in-progress job", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "deploy", status: "in_progress", conclusion: null, details_url: jobUrl },
+			]);
+			mockedGetWorkflowJob.mockResolvedValue({
+				steps: [
+					{ name: "Checkout", status: "completed", conclusion: "success", number: 1 },
+					{ name: "Deploy to Pages", status: "in_progress", conclusion: null, number: 2 },
+				],
+			});
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "deploy");
+
+			expect(result.state).toBe("pending");
+			expect(result.summary).toContain(":arrows_counterclockwise: Deploy to Pages");
+		});
+
+		it("does not fetch steps for passed jobs", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "success", details_url: jobUrl },
+			]);
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
+
+			expect(result.state).toBe("success");
+			expect(mockedGetWorkflowJob).not.toHaveBeenCalled();
+		});
+
+		it("does not fetch steps for a check run with no Actions job id in its URL", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "external", status: "completed", conclusion: "failure", details_url: "https://ci.example/build/9" },
+			]);
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+
+			expect(result.state).toBe("failure");
+			expect(mockedGetWorkflowJob).not.toHaveBeenCalled();
+		});
+
+		it("is best-effort: a failed step fetch just omits steps without failing aggregation", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "failure", details_url: jobUrl },
+			]);
+			mockedGetWorkflowJob.mockRejectedValue(new Error("boom"));
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+
+			expect(result.state).toBe("failure");
+			expect(result.summary).toContain("build");
 		});
 	});
 });

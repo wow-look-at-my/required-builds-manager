@@ -28,6 +28,19 @@ export interface WorkflowRun {
 	updated_at?: string | null;
 }
 
+export interface JobStep {
+	name: string;
+	// queued | in_progress | completed
+	status: string;
+	// success | failure | skipped | cancelled | neutral | null (while not completed)
+	conclusion: string | null;
+	number: number;
+}
+
+export interface WorkflowJob {
+	steps?: JobStep[];
+}
+
 export interface CheckRunOutput {
 	title: string;
 	summary: string;
@@ -148,6 +161,30 @@ export async function listWorkflowRuns(
 	return all;
 }
 
+// Fetches a single Actions job (by id) to read its individual steps. Used to show, for a failed or
+// in-progress check run, exactly which step failed or is running. Best-effort: returns null on any
+// error (e.g. the app lacks `actions:read`, or the check run isn't an Actions job) so the caller can
+// simply omit step detail. Requires the `actions:read` permission.
+export async function getWorkflowJob(
+	token: string,
+	owner: string,
+	repo: string,
+	jobId: number,
+): Promise<WorkflowJob | null> {
+	const url = `${GITHUB_API}/repos/${owner}/${repo}/actions/jobs/${jobId}`;
+	const res = await fetchWithRetry(url, {
+		headers: {
+			Authorization: `token ${token}`,
+			Accept: "application/vnd.github+json",
+			"User-Agent": "required-builds-manager",
+		},
+	});
+
+	if (!res.ok) return null;
+
+	return (await res.json()) as WorkflowJob;
+}
+
 // Finds the id of the check run we previously published for this commit, matched by name AND our
 // app id. Used to update that run in place rather than stacking duplicate "all-builds" check runs
 // side by side on every event. Best-effort: returns null (-> create a fresh run) on any API error.
@@ -233,6 +270,12 @@ export async function publishCheckRun(
 	});
 
 	if (!res.ok) {
-		throw new Error(`GitHub API error publishing check run: ${res.status} ${res.statusText}`);
+		// Attach the HTTP status so callers can distinguish a permanent permission error (403 — the
+		// app's installation lacks an approved `checks:write`) from a transient one worth retrying.
+		const err = new Error(`GitHub API error publishing check run: ${res.status} ${res.statusText}`) as Error & {
+			status?: number;
+		};
+		err.status = res.status;
+		throw err;
 	}
 }
