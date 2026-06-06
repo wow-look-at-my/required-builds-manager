@@ -1,6 +1,6 @@
 # Required Builds Manager
 
-A Cloudflare Worker that aggregates GitHub commit statuses, check runs, and workflow runs into a single combined "all-builds" check run. Install it as a GitHub App to get a unified pass/fail signal across all your CI checks.
+A Cloudflare Worker that aggregates GitHub commit statuses, check runs, and workflow runs into a single combined "all-builds" **commit status**. Install it as a GitHub App to get a unified pass/fail signal across all your CI checks — set `all-builds` as your one required check in branch protection.
 
 ## How It Works
 
@@ -13,19 +13,22 @@ When any CI system reports a status, check run, or workflow run on a commit, thi
    - **failure** if any build failed
    - **pending** if any build is still running, or if builds have been triggered but none have reported yet (fail closed -- the combined check never goes green before CI has actually run)
    - **success** only if all reported builds passed
-5. Publishes the result as an "all-builds" check run
+5. Publishes the result as an "all-builds" **commit status**, whose "Details" link opens a worker-served breakdown page
 
 ### Detailed failure reporting
 
-The check run doesn't just say pass/fail:
+The commit status doesn't just say pass/fail:
 
-- Its **title** is a running count that updates as builds finish — `2/3 builds passed` while CI is in flight, or `1/3 builds failed` the moment something breaks.
-- Its **Markdown summary** lists every build grouped into **Failed / In progress / Passed**, where each build is a link to its own check run and each failing build shows its error detail. On a failure the passing builds are omitted, so the summary stays focused on what broke. A `Total time` line (first build start → last build finish) is included when the builds report timing — and the check run's start is set to that first build start, so GitHub's own "Successful in Xs" line shows the full CI duration too.
-- Its **Details** link points at the commit's [Checks page on GitHub](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/about-status-checks) (`/<owner>/<repo>/commit/<sha>/checks`), GitHub's native view of every build's result for the commit. (Without an explicit link, GitHub would default this to the App's homepage — the bare worker URL, which shows nothing useful.)
+- Its **description** is a running count that updates as builds finish — `2/3 builds passed` while CI is in flight, or `1/3 builds failed` the moment something breaks.
+- Its **"Details" link** (`target_url`) opens a **worker-served breakdown page** listing every build grouped into **Failed / In progress / Passed**, where each build links to its own check and a failed or in-progress Actions job shows its individual steps (which step failed / is running). On a failure the passing builds are omitted, so the page stays focused on what broke. A `Total time` line (first build start → last build finish) is shown when builds report timing. The page shows build and step **state only — never logs**.
 
-This is why the worker publishes a **check run** rather than a commit status: a status `description` is capped at ~140 characters, while a check run's `output.summary` holds a full Markdown breakdown.
+Why a **commit status** rather than a check run? GitHub **freezes a check run once it's `completed`** — a later API call can't move it back to "in progress" — so a check run that went green (even prematurely, before every build had registered) stayed green and kept merge unblocked. A commit status has no such freeze: GitHub keeps the latest status per context and lets it move between success / pending / failure on every event, so `all-builds` can always correct itself (including dropping back to pending/failure if a new build appears for an already-green commit). The trade-off — a status `description` is capped at ~140 characters — is why the full breakdown is served as its own page rather than inline.
 
-For a `startup_failure` (invalid workflow YAML), GitHub exposes the validation message only in its web UI, not via the API — so the summary names the broken workflow and links to the run, where the full "Invalid workflow file..." text is shown.
+#### Breakdown page access (capability URL)
+
+The breakdown page lives at `/b/{owner}/{repo}/{sha}?k=<sig>`, where `<sig>` is an HMAC signature of the repo + commit (keyed by the webhook secret). The worker verifies it and returns `404` otherwise. Because GitHub only shows a private repo's commit status — and therefore this URL — to people with read access to the repo, **holding a valid link means you were granted access to it**; the signature just stops anyone guessing the URL for a repo they can't see. It is a capability URL: anyone you share the link with can open it, and it isn't revoked if someone later loses repo access — an acceptable trade since the page reveals only build/step state, no logs. (For public repos the CI state is public anyway.)
+
+For a `startup_failure` (invalid workflow YAML), GitHub exposes the validation message only in its web UI, not via the API — so the breakdown names the broken workflow and links to the run, where the full "Invalid workflow file..." text is shown.
 
 The worker updates a **single** `all-builds` check run in place as builds report (rather than stacking a new check run on every event), so each commit shows one entry whose state changes over time. To keep this exact even when many builds finish at once (e.g. a large matrix), publishing for a given commit is serialized through a per-commit Durable Object — so concurrent events can't race into duplicate check runs. Every individual workflow job already appears as its own check run, so the breakdown covers per-job state without subscribing to `workflow_job` events.
 
@@ -59,9 +62,9 @@ If no config file exists, the app uses `all-builds` as the context with no ignor
 
 - A [GitHub App](https://docs.github.com/en/apps/creating-github-apps) with:
   - **Webhook events**: `Status`, `Check run`, `Workflow run`
-  - **Permissions**: `Checks` (read & write), `Commit statuses` (read), `Actions` (read), `Contents` (read)
+  - **Permissions**: `Commit statuses` (read & write), `Checks` (read), `Actions` (read), `Contents` (read)
 
-  > **Note:** the worker publishes its combined result as a **check run**, so it needs `Checks: write`. If you are upgrading from a version that published a commit status, bump the App's `Checks` permission from read to read & write — GitHub will prompt each installation to approve the new permission before the worker can post.
+  > **Note:** the worker publishes its combined result as a **commit status**, so it needs `Commit statuses: write`. It reads check runs and workflow runs (`Checks: read`, `Actions: read`) to aggregate them. (Earlier versions published a check run and needed `Checks: write`; that is no longer required.)
 - A [Cloudflare Workers](https://workers.cloudflare.com/) account
 
 ### Configuration
@@ -95,10 +98,12 @@ npx tsc --noEmit    # Type-check
 
 ```
 src/
-├── index.ts               # Worker entry point and webhook handler
-├── aggregate.ts           # Build state aggregation + Markdown breakdown
-├── check-run-publisher.ts # Durable Object that serializes publishing per commit
-├── auth.ts                # GitHub App authentication (JWT, installation tokens)
+├── index.ts               # Webhook handler + the GET breakdown-page route
+├── aggregate.ts           # Build-state aggregation (structured per-build breakdown)
+├── render.ts              # Renders the breakdown as a self-hosted HTML page
+├── sign.ts                # HMAC capability-URL signing for the breakdown page
+├── check-run-publisher.ts # Durable Object: serializes publishing + self-heal alarm
+├── auth.ts                # GitHub App authentication (JWT, installation tokens/id)
 ├── config.ts              # Per-repo YAML config loading (with org fallback)
 ├── github.ts              # GitHub API client (statuses, check runs, workflow runs)
 └── verify.ts              # Webhook signature verification
