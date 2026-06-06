@@ -1,8 +1,10 @@
 import { verifySignature } from "./verify";
-import { computeAllBuildsState, toCheckRunResult, type IncomingDetail } from "./aggregate";
+import { computeAllBuildsState, type IncomingDetail } from "./aggregate";
 import { publishViaCoordinator, type CheckRunPublisher } from "./check-run-publisher";
-import { getInstallationToken } from "./auth";
+import { getInstallationToken, getInstallationId } from "./auth";
 import { getRepoConfig } from "./config";
+import { signResource, verifyResource } from "./sign";
+import { renderBreakdownHtml } from "./render";
 
 // The Durable Object class must be exported from the Worker's entry module so the runtime can
 // instantiate it (see the durable_objects binding in wrangler.jsonc).
@@ -113,6 +115,13 @@ function mapWorkflowRunState(status: string, conclusion: string | null): string 
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
+		const url = new URL(request.url);
+
+		// Self-hosted breakdown page -- the commit status's "Details" link. Gated by a capability URL.
+		if (request.method === "GET" && url.pathname.startsWith("/b/")) {
+			return serveBreakdown(request, env, url);
+		}
+
 		if (request.method !== "POST") {
 			return new Response("Method not allowed", { status: 405 });
 		}
@@ -234,18 +243,20 @@ export default {
 			incoming,
 		);
 
-		const { status, conclusion } = toCheckRunResult(result.state);
+		// The status's "Details" link is a capability URL to our self-hosted breakdown page, signed so
+		// it can't be guessed (see sign.ts). target_url is constant per SHA, so the reconcile alarm
+		// reuses it.
+		const sig = await signResource(env.WEBHOOK_SECRET, resourceId(owner, repo, sha));
 		const update = {
-			status,
-			conclusion,
-			output: { title: result.title, summary: result.summary },
-			startedAt: result.startedAt,
+			state: result.state,
+			description: result.title,
+			targetUrl: `${url.origin}/b/${owner}/${repo}/${sha}?k=${sig}`,
 		};
 
-		// Route through the per-commit Durable Object so simultaneous build events serialize and
-		// produce a single "all-builds" check run rather than duplicates. installationId + the ignore
-		// patterns are passed so the DO's reconciliation alarm can mint a fresh token and re-aggregate
-		// later if a terminal event is missed (see CheckRunPublisher).
+		// Route through the per-commit Durable Object so simultaneous build events serialize (last to
+		// arrive wins, no interleaved stale publish) and the self-heal alarm can re-publish if a
+		// terminal event is missed. installationId + ignore patterns + target_url are carried so the
+		// alarm can mint a fresh token and re-aggregate later (see CheckRunPublisher).
 		const doPublish = (tok: string) =>
 			publishViaCoordinator(
 				env.CHECK_RUN_PUBLISHER,
@@ -263,23 +274,22 @@ export default {
 		try {
 			await doPublish(token);
 		} catch (err) {
-			// A 403 on publish almost always means the cached installation token predates a
-			// permissions change — GitHub bakes the installation's permissions into the token at mint
-			// time, so a token minted before `checks:write` was approved keeps getting 403 on writes
-			// even though reads (which it already had) still work. Force a brand-new token and retry
-			// once; this self-recovers the moment the permission is approved instead of waiting up to
-			// an hour for the cached token to expire. If it still fails, it's a real error.
+			// A 403 on publish almost always means the cached installation token predates a permissions
+			// change — GitHub bakes the installation's permissions into the token at mint time, so a
+			// token minted before `statuses:write` was approved keeps 403ing on writes even though reads
+			// (which it already had) still work. Force a brand-new token and retry once; this
+			// self-recovers the moment the permission is approved. If it still fails, it's a real error.
 			if ((err as { status?: number }).status === 403) {
 				try {
 					const fresh = await getInstallationToken(env, installationId, env.TOKEN_CACHE, true);
 					await doPublish(fresh);
 				} catch (retryErr) {
 					const msg = retryErr instanceof Error ? retryErr.message : "Unknown error";
-					return new Response(`Failed to publish check run: ${msg}`, { status: 502 });
+					return new Response(`Failed to publish status: ${msg}`, { status: 502 });
 				}
 			} else {
 				const msg = err instanceof Error ? err.message : "Unknown error";
-				return new Response(`Failed to publish check run: ${msg}`, { status: 502 });
+				return new Response(`Failed to publish status: ${msg}`, { status: 502 });
 			}
 		}
 
@@ -289,3 +299,67 @@ export default {
 		});
 	},
 };
+
+// The canonical resource string that the capability-URL signature covers.
+function resourceId(owner: string, repo: string, sha: string): string {
+	return `${owner}/${repo}/${sha}`;
+}
+
+// Serves the self-hosted per-build breakdown page (the commit status's "Details" link), at
+// GET /b/{owner}/{repo}/{sha}?k=<sig>. The signature IS the access control: GitHub only reveals a
+// private repo's status (and thus this URL) to users with read access, so anyone holding a valid URL
+// was shown it. A missing/invalid signature is indistinguishable from a guess, so we 404 (never
+// revealing whether the repo/sha exists). The page shows build + step state, never logs.
+async function serveBreakdown(request: Request, env: Env, url: URL): Promise<Response> {
+	const notFound = () => new Response("Not found", { status: 404 });
+
+	// Path: /b/{owner}/{repo}/{sha}
+	const parts = url.pathname.split("/").filter(Boolean);
+	if (parts.length !== 4) return notFound();
+	const [, owner, repo, sha] = parts;
+	const k = url.searchParams.get("k") ?? "";
+
+	if (!env.WEBHOOK_SECRET) {
+		return new Response("Server misconfigured: missing WEBHOOK_SECRET", { status: 500 });
+	}
+	if (!(await verifyResource(env.WEBHOOK_SECRET, resourceId(owner, repo, sha), k))) {
+		return notFound();
+	}
+
+	let html: string;
+	try {
+		const installationId = await getInstallationId(env, owner, repo);
+		const token = await getInstallationToken(env, installationId, env.TOKEN_CACHE);
+		const config = await getRepoConfig(token, owner, repo);
+		const appId = parseInt(env.GITHUB_APP_ID, 10);
+		const result = await computeAllBuildsState(
+			token,
+			owner,
+			repo,
+			sha,
+			"success",
+			config.context,
+			Number.isNaN(appId) ? undefined : appId,
+			config,
+		);
+		html = renderBreakdownHtml(owner, repo, sha, result);
+	} catch {
+		html = renderBreakdownHtml(owner, repo, sha, {
+			state: "error",
+			title: "Could not load builds",
+			failed: [],
+			pending: [],
+			passed: [],
+		});
+	}
+
+	return new Response(html, {
+		status: 200,
+		headers: {
+			"Content-Type": "text/html; charset=utf-8",
+			// The URL carries the capability secret; keep it out of referers and shared caches.
+			"Referrer-Policy": "no-referrer",
+			"Cache-Control": "no-store",
+		},
+	});
+}

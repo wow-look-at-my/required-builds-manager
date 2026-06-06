@@ -6,6 +6,8 @@ import * as aggregate from "../src/aggregate";
 import * as coordinator from "../src/check-run-publisher";
 import * as auth from "../src/auth";
 import * as config from "../src/config";
+import * as sign from "../src/sign";
+import * as render from "../src/render";
 
 vi.mock("../src/verify", () => ({
 	verifySignature: vi.fn(),
@@ -13,13 +15,6 @@ vi.mock("../src/verify", () => ({
 
 vi.mock("../src/aggregate", () => ({
 	computeAllBuildsState: vi.fn(),
-	// Real mapping — the handler uses it to derive the published status/conclusion, which the
-	// publish assertions below check.
-	toCheckRunResult: (state: string) => {
-		if (state === "pending") return { status: "in_progress", conclusion: null };
-		if (state === "success") return { status: "completed", conclusion: "success" };
-		return { status: "completed", conclusion: "failure" };
-	},
 }));
 
 vi.mock("../src/check-run-publisher", () => ({
@@ -29,25 +24,39 @@ vi.mock("../src/check-run-publisher", () => ({
 
 vi.mock("../src/auth", () => ({
 	getInstallationToken: vi.fn(),
+	getInstallationId: vi.fn(),
 }));
 
 vi.mock("../src/config", () => ({
 	getRepoConfig: vi.fn(),
 }));
 
+vi.mock("../src/sign", () => ({
+	signResource: vi.fn(),
+	verifyResource: vi.fn(),
+}));
+
+vi.mock("../src/render", () => ({
+	renderBreakdownHtml: vi.fn(),
+}));
+
 const mockedVerify = vi.mocked(verify.verifySignature);
 const mockedCompute = vi.mocked(aggregate.computeAllBuildsState);
 const mockedPublishViaCoordinator = vi.mocked(coordinator.publishViaCoordinator);
 const mockedGetToken = vi.mocked(auth.getInstallationToken);
+const mockedGetInstallationId = vi.mocked(auth.getInstallationId);
 const mockedGetRepoConfig = vi.mocked(config.getRepoConfig);
+const mockedSignResource = vi.mocked(sign.signResource);
+const mockedVerifyResource = vi.mocked(sign.verifyResource);
+const mockedRender = vi.mocked(render.renderBreakdownHtml);
 
 const defaultConfig = { context: "all-builds", ignore: [] };
-const okResult = { state: "success" as const, title: "All builds passed", summary: "All builds passed." };
+const okResult = { state: "success" as const, title: "All builds passed", failed: [], pending: [], passed: [] };
+// The capability URL the handler builds: origin + /b/{owner}/{repo}/{sha}?k=<sig>. signResource is
+// mocked to "sigvalue", and the request origin is https://worker.example.com.
+const expectedTargetUrl = "https://worker.example.com/b/myorg/myrepo/abc123def?k=sigvalue";
 
-function makeRequest(
-	body: object,
-	headers: Record<string, string> = {},
-): Request {
+function makeRequest(body: object, headers: Record<string, string> = {}): Request {
 	return new Request("https://worker.example.com/webhook", {
 		method: "POST",
 		headers: {
@@ -60,10 +69,7 @@ function makeRequest(
 	});
 }
 
-function makeCheckRunRequest(
-	body: object,
-	headers: Record<string, string> = {},
-): Request {
+function makeCheckRunRequest(body: object, headers: Record<string, string> = {}): Request {
 	return new Request("https://worker.example.com/webhook", {
 		method: "POST",
 		headers: {
@@ -76,10 +82,7 @@ function makeCheckRunRequest(
 	});
 }
 
-function makeWorkflowRunRequest(
-	body: object,
-	headers: Record<string, string> = {},
-): Request {
+function makeWorkflowRunRequest(body: object, headers: Record<string, string> = {}): Request {
 	return new Request("https://worker.example.com/webhook", {
 		method: "POST",
 		headers: {
@@ -90,6 +93,10 @@ function makeWorkflowRunRequest(
 		},
 		body: JSON.stringify(body),
 	});
+}
+
+function makeGetRequest(path: string): Request {
+	return new Request(`https://worker.example.com${path}`, { method: "GET" });
 }
 
 const statusPayload = {
@@ -131,7 +138,11 @@ describe("worker fetch handler", () => {
 		mockedCompute.mockResolvedValue(okResult);
 		mockedPublishViaCoordinator.mockResolvedValue(undefined);
 		mockedGetToken.mockResolvedValue("test-installation-token");
+		mockedGetInstallationId.mockResolvedValue(12345);
 		mockedGetRepoConfig.mockResolvedValue(defaultConfig);
+		mockedSignResource.mockResolvedValue("sigvalue");
+		mockedVerifyResource.mockResolvedValue(true);
+		mockedRender.mockReturnValue("<html>breakdown</html>");
 	});
 
 	it("rejects non-POST methods", async () => {
@@ -200,7 +211,7 @@ describe("worker fetch handler", () => {
 		expect(await res.text()).toBe("Missing installation ID in webhook payload");
 	});
 
-	it("processes a valid status event and publishes a check run", async () => {
+	it("processes a valid status event and publishes a commit status", async () => {
 		const req = makeRequest(statusPayload);
 		const res = await worker.fetch(req, env as any);
 
@@ -210,11 +221,7 @@ describe("worker fetch handler", () => {
 			12345,
 			expect.anything(),
 		);
-		expect(mockedGetRepoConfig).toHaveBeenCalledWith(
-			"test-installation-token",
-			"myorg",
-			"myrepo",
-		);
+		expect(mockedGetRepoConfig).toHaveBeenCalledWith("test-installation-token", "myorg", "myrepo");
 		expect(mockedCompute).toHaveBeenCalledWith(
 			"test-installation-token",
 			"myorg",
@@ -233,7 +240,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"all-builds",
-			{ status: "completed", conclusion: "success", output: { title: "All builds passed", summary: "All builds passed." } },
+			{ state: "success", description: "All builds passed", targetUrl: expectedTargetUrl },
 			12345,
 			12345,
 			[],
@@ -262,8 +269,8 @@ describe("worker fetch handler", () => {
 		);
 	});
 
-	it("publishes an in_progress check run with no conclusion for a pending aggregate", async () => {
-		mockedCompute.mockResolvedValue({ state: "pending", title: "build in progress", summary: "..." });
+	it("publishes a pending status (no terminal state) for a pending aggregate", async () => {
+		mockedCompute.mockResolvedValue({ state: "pending", title: "build in progress", failed: [], pending: [], passed: [] });
 		const req = makeRequest(statusPayload);
 		const res = await worker.fetch(req, env as any);
 
@@ -275,14 +282,14 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"all-builds",
-			{ status: "in_progress", conclusion: null, output: { title: "build in progress", summary: "..." } },
+			{ state: "pending", description: "build in progress", targetUrl: expectedTargetUrl },
 			12345,
 			12345,
 			[],
 		);
 	});
 
-	it("uses custom context from config as the check run name", async () => {
+	it("uses custom context from config as the status context", async () => {
 		const customConfig = { context: "combined-ci", ignore: [] };
 		mockedGetRepoConfig.mockResolvedValue(customConfig);
 
@@ -297,27 +304,27 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"combined-ci",
-			{ status: "completed", conclusion: "success", output: { title: "All builds passed", summary: "All builds passed." } },
+			{ state: "success", description: "All builds passed", targetUrl: expectedTargetUrl },
 			12345,
 			12345,
 			[],
 		);
 	});
 
-	it("returns 502 when check run publishing fails", async () => {
-		mockedPublishViaCoordinator.mockRejectedValue(new Error("checks: write missing"));
+	it("returns 502 when status publishing fails", async () => {
+		mockedPublishViaCoordinator.mockRejectedValue(new Error("statuses: write missing"));
 		const req = makeRequest(statusPayload);
 		const res = await worker.fetch(req, env as any);
 
 		expect(res.status).toBe(502);
-		expect(await res.text()).toBe("Failed to publish check run: checks: write missing");
+		expect(await res.text()).toBe("Failed to publish status: statuses: write missing");
 	});
 
 	it("force-refreshes the token and retries once when publishing fails with 403", async () => {
 		// A 403 typically means the cached installation token predates a permissions change (GitHub
-		// snapshots permissions into the token at mint time). The handler should mint a fresh token
-		// and retry once — recovering immediately after `checks:write` is approved.
-		const forbidden = Object.assign(new Error("GitHub API error publishing check run: 403 Forbidden"), {
+		// snapshots permissions into the token at mint time). The handler should mint a fresh token and
+		// retry once — recovering immediately after `statuses:write` is approved.
+		const forbidden = Object.assign(new Error("GitHub API error publishing status: 403 Forbidden"), {
 			status: 403,
 		});
 		mockedPublishViaCoordinator.mockRejectedValueOnce(forbidden).mockResolvedValueOnce(undefined);
@@ -332,7 +339,6 @@ describe("worker fetch handler", () => {
 	});
 
 	it("returns 502 if a 403 persists even after the forced token refresh", async () => {
-		// A 403 that survives a fresh token is a real permission problem retrying can't fix.
 		const forbidden = Object.assign(new Error("403 Forbidden"), { status: 403 });
 		mockedPublishViaCoordinator.mockRejectedValue(forbidden);
 
@@ -544,8 +550,8 @@ describe("worker fetch handler", () => {
 
 	// workflow_run event tests
 
-	it("maps workflow_run startup_failure to failure and publishes a failing check run", async () => {
-		mockedCompute.mockResolvedValue({ state: "failure", title: "CI failed: startup_failure", summary: "..." });
+	it("maps workflow_run startup_failure to failure and publishes a failing status", async () => {
+		mockedCompute.mockResolvedValue({ state: "failure", title: "CI failed: startup_failure", failed: [], pending: [], passed: [] });
 		const req = makeWorkflowRunRequest(workflowRunPayload);
 		const res = await worker.fetch(req, env as any);
 
@@ -568,7 +574,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"all-builds",
-			{ status: "completed", conclusion: "failure", output: { title: "CI failed: startup_failure", summary: "..." } },
+			{ state: "failure", description: "CI failed: startup_failure", targetUrl: expectedTargetUrl },
 			12345,
 			12345,
 			[],
@@ -626,5 +632,43 @@ describe("worker fetch handler", () => {
 
 		expect(res.status).toBe(400);
 		expect(await res.text()).toBe("Missing installation ID in webhook payload");
+	});
+
+	// Breakdown page (GET /b/{owner}/{repo}/{sha}?k=<sig>) -- the commit status's "Details" link.
+
+	it("serves the breakdown HTML for a valid capability URL", async () => {
+		const res = await worker.fetch(makeGetRequest("/b/myorg/myrepo/abc123?k=validsig"), env as any);
+
+		expect(res.status).toBe(200);
+		expect(res.headers.get("Content-Type")).toContain("text/html");
+		expect(res.headers.get("Referrer-Policy")).toBe("no-referrer");
+		expect(res.headers.get("Cache-Control")).toBe("no-store");
+		expect(await res.text()).toBe("<html>breakdown</html>");
+		expect(mockedVerifyResource).toHaveBeenCalledWith("test-secret", "myorg/myrepo/abc123", "validsig");
+		expect(mockedRender).toHaveBeenCalled();
+	});
+
+	it("404s a breakdown URL with an invalid signature (no leak of repo/sha)", async () => {
+		mockedVerifyResource.mockResolvedValue(false);
+		const res = await worker.fetch(makeGetRequest("/b/myorg/myrepo/abc123?k=bad"), env as any);
+
+		expect(res.status).toBe(404);
+		expect(mockedGetInstallationId).not.toHaveBeenCalled();
+		expect(mockedRender).not.toHaveBeenCalled();
+	});
+
+	it("404s a malformed breakdown path", async () => {
+		const res = await worker.fetch(makeGetRequest("/b/onlyone"), env as any);
+
+		expect(res.status).toBe(404);
+		expect(mockedVerifyResource).not.toHaveBeenCalled();
+	});
+
+	it("still renders (200) an error page when aggregation fails -- never leaks a stack trace", async () => {
+		mockedGetInstallationId.mockRejectedValue(new Error("no installation"));
+		const res = await worker.fetch(makeGetRequest("/b/myorg/myrepo/abc123?k=validsig"), env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedRender).toHaveBeenCalled();
 	});
 });

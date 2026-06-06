@@ -41,20 +41,6 @@ export interface WorkflowJob {
 	steps?: JobStep[];
 }
 
-export interface CheckRunOutput {
-	title: string;
-	summary: string;
-	text?: string;
-}
-
-export interface CheckRunUpdate {
-	status: "in_progress" | "completed";
-	conclusion: string | null;
-	output: CheckRunOutput;
-	// ISO timestamp of the earliest build start, so GitHub's "in Xs" reflects total CI wall-clock.
-	startedAt?: string;
-}
-
 export interface StatusUpdate {
 	// Commit-status states map 1:1 to the aggregate's states. Unlike a completed check run, a status
 	// can move freely between these on every event (GitHub keeps the latest per context).
@@ -194,106 +180,6 @@ export async function getWorkflowJob(
 	if (!res.ok) return null;
 
 	return (await res.json()) as WorkflowJob;
-}
-
-// Finds the id of the check run we previously published for this commit, matched by name AND our
-// app id. Used to update that run in place rather than stacking duplicate "all-builds" check runs
-// side by side on every event. Best-effort: returns null (-> create a fresh run) on any API error.
-async function findOwnCheckRunId(
-	token: string,
-	owner: string,
-	repo: string,
-	sha: string,
-	name: string,
-	appId?: number,
-): Promise<number | null> {
-	// The check-runs list endpoint supports a check_name filter, so this is a cheap, targeted lookup.
-	const url = `${GITHUB_API}/repos/${owner}/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}&per_page=100`;
-	const res = await fetchWithRetry(url, {
-		headers: {
-			Authorization: `token ${token}`,
-			Accept: "application/vnd.github+json",
-			"User-Agent": "required-builds-manager",
-		},
-	});
-
-	if (!res.ok) return null;
-
-	const data: { check_runs: { id: number; app?: { id: number } }[] } = await res.json();
-	// API returns newest first — reuse the most recent run created by our app.
-	for (const cr of data.check_runs) {
-		if (appId == null || cr.app?.id === appId) return cr.id;
-	}
-	return null;
-}
-
-// Publishes the combined result as a check run (rather than a commit status) so the
-// `output.summary` Markdown field can carry a full per-build breakdown — the commit-status
-// `description` is capped at ~140 chars. Creating check runs requires the GitHub App to hold
-// the `checks: write` permission.
-//
-// Updates our existing check run in place when one is found (so the commit shows a single
-// "all-builds" entry that changes state, like a re-run, instead of many duplicates); otherwise
-// creates a new one.
-export async function publishCheckRun(
-	token: string,
-	owner: string,
-	repo: string,
-	sha: string,
-	name: string,
-	update: CheckRunUpdate,
-	appId?: number,
-): Promise<void> {
-	const existingId = await findOwnCheckRunId(token, owner, repo, sha, name, appId);
-
-	const body: Record<string, unknown> = { name, status: update.status, output: update.output };
-	// Point the check's "Details" link at the commit's Checks page on GitHub — the native view that
-	// lists every build's result for this commit, which is where someone investigating an all-builds
-	// failure actually wants to go. Without this, GitHub defaults the link to the App's homepage URL
-	// (the bare worker domain), which serves nothing useful.
-	body.details_url = `https://github.com/${owner}/${repo}/commit/${sha}/checks`;
-	// `conclusion` is required when (and only when) the run is completed.
-	if (update.status === "completed") {
-		body.conclusion = update.conclusion ?? "failure";
-	}
-	// Setting started_at to the first build's start makes GitHub render the run's duration ("in Xs")
-	// as the total CI wall-clock; completed_at defaults to now when we mark the run completed.
-	if (update.startedAt) {
-		body.started_at = update.startedAt;
-	}
-
-	let url: string;
-	let method: string;
-	if (existingId != null) {
-		// Update the existing run. `head_sha` is fixed and must not be sent on update.
-		url = `${GITHUB_API}/repos/${owner}/${repo}/check-runs/${existingId}`;
-		method = "PATCH";
-	} else {
-		url = `${GITHUB_API}/repos/${owner}/${repo}/check-runs`;
-		method = "POST";
-		body.head_sha = sha;
-	}
-
-	const res = await fetchWithRetry(url, {
-		method,
-		headers: {
-			Authorization: `token ${token}`,
-			Accept: "application/vnd.github+json",
-			"User-Agent": "required-builds-manager",
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify(body),
-	});
-
-	if (!res.ok) {
-		// Attach the HTTP status so callers can distinguish a permanent permission error (403 — the
-		// app's installation lacks an approved `checks:write`) from a transient one worth retrying.
-		const err = new Error(`GitHub API error publishing check run: ${res.status} ${res.statusText}`) as Error & {
-			status?: number;
-		};
-		err.status = res.status;
-		throw err;
-	}
 }
 
 // Publishes the combined result as a COMMIT STATUS (not a check run). GitHub keeps the latest status
