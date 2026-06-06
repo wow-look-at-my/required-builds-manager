@@ -236,6 +236,11 @@ export async function publishCheckRun(
 	const existingId = await findOwnCheckRunId(token, owner, repo, sha, name, appId);
 
 	const body: Record<string, unknown> = { name, status: update.status, output: update.output };
+	// Point the check's "Details" link at the commit's Checks page on GitHub — the native view that
+	// lists every build's result for this commit, which is where someone investigating an all-builds
+	// failure actually wants to go. Without this, GitHub defaults the link to the App's homepage URL
+	// (the bare worker domain), which serves nothing useful.
+	body.details_url = `https://github.com/${owner}/${repo}/commit/${sha}/checks`;
 	// `conclusion` is required when (and only when) the run is completed.
 	if (update.status === "completed") {
 		body.conclusion = update.conclusion ?? "failure";
