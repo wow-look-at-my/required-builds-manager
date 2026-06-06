@@ -15,6 +15,7 @@ vi.mock("../src/verify", () => ({
 
 vi.mock("../src/aggregate", () => ({
 	computeAllBuildsState: vi.fn(),
+	enrichWithSteps: vi.fn(),
 }));
 
 vi.mock("../src/check-run-publisher", () => ({
@@ -42,6 +43,7 @@ vi.mock("../src/render", () => ({
 
 const mockedVerify = vi.mocked(verify.verifySignature);
 const mockedCompute = vi.mocked(aggregate.computeAllBuildsState);
+const mockedEnrich = vi.mocked(aggregate.enrichWithSteps);
 const mockedPublishViaCoordinator = vi.mocked(coordinator.publishViaCoordinator);
 const mockedGetToken = vi.mocked(auth.getInstallationToken);
 const mockedGetInstallationId = vi.mocked(auth.getInstallationId);
@@ -245,6 +247,8 @@ describe("worker fetch handler", () => {
 			12345,
 			[],
 		);
+		// The webhook path publishes state + title only; it must NOT pay for per-step enrichment.
+		expect(mockedEnrich).not.toHaveBeenCalled();
 	});
 
 	it("passes the incoming status description and target_url as detail", async () => {
@@ -645,6 +649,8 @@ describe("worker fetch handler", () => {
 		expect(res.headers.get("Cache-Control")).toBe("no-store");
 		expect(await res.text()).toBe("<html>breakdown</html>");
 		expect(mockedVerifyResource).toHaveBeenCalledWith("test-secret", "myorg/myrepo/abc123", "validsig");
+		// The breakdown page (and only it) enriches per-step detail before rendering.
+		expect(mockedEnrich).toHaveBeenCalled();
 		expect(mockedRender).toHaveBeenCalled();
 	});
 

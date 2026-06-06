@@ -1,5 +1,5 @@
 import { verifySignature } from "./verify";
-import { computeAllBuildsState, type IncomingDetail } from "./aggregate";
+import { computeAllBuildsState, enrichWithSteps, type IncomingDetail } from "./aggregate";
 import { publishViaCoordinator, type CheckRunPublisher } from "./check-run-publisher";
 import { getInstallationToken, getInstallationId } from "./auth";
 import { getRepoConfig } from "./config";
@@ -342,6 +342,9 @@ async function serveBreakdown(request: Request, env: Env, url: URL): Promise<Res
 			Number.isNaN(appId) ? undefined : appId,
 			config,
 		);
+		// Only the breakdown page needs per-step detail, so the per-job getWorkflowJob calls happen
+		// here (rare, human-triggered) rather than on every webhook event (see enrichWithSteps).
+		await enrichWithSteps(token, owner, repo, result);
 		html = renderBreakdownHtml(owner, repo, sha, result);
 	} catch {
 		html = renderBreakdownHtml(owner, repo, sha, {
