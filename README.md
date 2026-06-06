@@ -1,6 +1,6 @@
 # Required Builds Manager
 
-A Cloudflare Worker that aggregates GitHub commit statuses, check runs, and workflow runs into a single combined "all-builds" status. Install it as a GitHub App to get a unified pass/fail signal across all your CI checks.
+A Cloudflare Worker that aggregates GitHub commit statuses, check runs, and workflow runs into a single combined "all-builds" check run. Install it as a GitHub App to get a unified pass/fail signal across all your CI checks.
 
 ## How It Works
 
@@ -13,13 +13,19 @@ When any CI system reports a status, check run, or workflow run on a commit, thi
    - **failure** if any build failed
    - **pending** if any build is still running
    - **success** only if all builds passed
-5. Posts the result back as an "all-builds" commit status
+5. Publishes the result as an "all-builds" check run
+
+### Detailed failure reporting
+
+The check run doesn't just say pass/fail — its title names the specific build that failed (e.g. `lint failed: 3 errors`, or `2 builds failed`), and its Markdown summary lists every build grouped into **Failed / In progress / Passed**, with each failing build's error detail and a link to where the full error renders. This is why the worker publishes a **check run** rather than a commit status: a status `description` is capped at ~140 characters, while a check run's `output.summary` holds a full Markdown breakdown.
+
+For a `startup_failure` (invalid workflow YAML), GitHub exposes the validation message only in its web UI, not via the API — so the summary names the broken workflow and links to the run, where the full "Invalid workflow file..." text is shown.
 
 ### Catching workflow startup failures
 
 When a workflow's YAML is invalid (or it otherwise fails before any job runs), GitHub records it as a `startup_failure` workflow run that produces **zero check runs and zero statuses** — invisible to the statuses and check-runs APIs. The worker also listens for `workflow_run` events and folds any `startup_failure` into the aggregate, so a broken workflow blocks the `all-builds` check instead of silently passing. (This requires the `Actions` read permission; if it's missing, the worker degrades gracefully and simply skips this check.)
 
-This lets you use a single required status check (`all-builds`) in your branch protection rules instead of listing every individual CI job.
+This lets you use a single required check (`all-builds`) in your branch protection rules instead of listing every individual CI job.
 
 ## Per-Repo Configuration
 
@@ -45,7 +51,9 @@ If no config file exists, the app uses `all-builds` as the context with no ignor
 
 - A [GitHub App](https://docs.github.com/en/apps/creating-github-apps) with:
   - **Webhook events**: `Status`, `Check run`, `Workflow run`
-  - **Permissions**: `Commit statuses` (read & write), `Checks` (read), `Actions` (read), `Contents` (read)
+  - **Permissions**: `Checks` (read & write), `Commit statuses` (read), `Actions` (read), `Contents` (read)
+
+  > **Note:** the worker publishes its combined result as a **check run**, so it needs `Checks: write`. If you are upgrading from a version that published a commit status, bump the App's `Checks` permission from read to read & write — GitHub will prompt each installation to approve the new permission before the worker can post.
 - A [Cloudflare Workers](https://workers.cloudflare.com/) account
 
 ### Configuration
