@@ -226,9 +226,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"all-builds",
-			"completed",
-			"success",
-			{ title: "All builds passed", summary: "All builds passed." },
+			{ status: "completed", conclusion: "success", output: { title: "All builds passed", summary: "All builds passed." } },
 			12345,
 		);
 	});
@@ -268,9 +266,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"all-builds",
-			"in_progress",
-			null,
-			{ title: "build in progress", summary: "..." },
+			{ status: "in_progress", conclusion: null, output: { title: "build in progress", summary: "..." } },
 			12345,
 		);
 	});
@@ -290,9 +286,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"combined-ci",
-			"completed",
-			"success",
-			{ title: "All builds passed", summary: "All builds passed." },
+			{ status: "completed", conclusion: "success", output: { title: "All builds passed", summary: "All builds passed." } },
 			12345,
 		);
 	});
@@ -532,9 +526,7 @@ describe("worker fetch handler", () => {
 			"myrepo",
 			"abc123def",
 			"all-builds",
-			"completed",
-			"failure",
-			{ title: "CI failed: startup_failure", summary: "..." },
+			{ status: "completed", conclusion: "failure", output: { title: "CI failed: startup_failure", summary: "..." } },
 			12345,
 		);
 	});

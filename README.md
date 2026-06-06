@@ -20,7 +20,7 @@ When any CI system reports a status, check run, or workflow run on a commit, thi
 The check run doesn't just say pass/fail:
 
 - Its **title** is a running count that updates as builds finish — `2/3 builds passed` while CI is in flight, or `1/3 builds failed` the moment something breaks.
-- Its **Markdown summary** lists every build grouped into **Failed / In progress / Passed**, where each build is a link to its own check run and each failing build shows its error detail. On a failure the passing builds are omitted, so the summary stays focused on what broke. A `Total time` line (first build start → last build finish) is included when the builds report timing.
+- Its **Markdown summary** lists every build grouped into **Failed / In progress / Passed**, where each build is a link to its own check run and each failing build shows its error detail. On a failure the passing builds are omitted, so the summary stays focused on what broke. A `Total time` line (first build start → last build finish) is included when the builds report timing — and the check run's start is set to that first build start, so GitHub's own "Successful in Xs" line shows the full CI duration too.
 
 This is why the worker publishes a **check run** rather than a commit status: a status `description` is capped at ~140 characters, while a check run's `output.summary` holds a full Markdown breakdown.
 

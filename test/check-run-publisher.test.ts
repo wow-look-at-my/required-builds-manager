@@ -28,7 +28,7 @@ describe("publishViaCoordinator (Durable Object)", () => {
 			.intercept({ path: "/repos/o/r/check-runs", method: "POST" })
 			.reply(201, { id: 1 });
 
-		await publishViaCoordinator(ns(), "token", "o", "r", "do-sha-1", "all-builds", "completed", "success", output, 99999);
+		await publishViaCoordinator(ns(), "token", "o", "r", "do-sha-1", "all-builds", { status: "completed", conclusion: "success", output }, 99999);
 	});
 
 	it("updates the existing check run in place through the DO", async () => {
@@ -41,7 +41,7 @@ describe("publishViaCoordinator (Durable Object)", () => {
 			.intercept({ path: "/repos/o/r/check-runs/42", method: "PATCH" })
 			.reply(200, { id: 42 });
 
-		await publishViaCoordinator(ns(), "token", "o", "r", "do-sha-2", "all-builds", "completed", "failure", output, 99999);
+		await publishViaCoordinator(ns(), "token", "o", "r", "do-sha-2", "all-builds", { status: "completed", conclusion: "failure", output }, 99999);
 	});
 
 	it("serializes concurrent publishes for one commit into a single create + update", async () => {
@@ -69,8 +69,8 @@ describe("publishViaCoordinator (Durable Object)", () => {
 
 		const namespace = ns();
 		await Promise.all([
-			publishViaCoordinator(namespace, "token", "o", "r", "do-sha-3", "all-builds", "in_progress", null, output, 99999),
-			publishViaCoordinator(namespace, "token", "o", "r", "do-sha-3", "all-builds", "completed", "success", output, 99999),
+			publishViaCoordinator(namespace, "token", "o", "r", "do-sha-3", "all-builds", { status: "in_progress", conclusion: null, output }, 99999),
+			publishViaCoordinator(namespace, "token", "o", "r", "do-sha-3", "all-builds", { status: "completed", conclusion: "success", output }, 99999),
 		]);
 	});
 });

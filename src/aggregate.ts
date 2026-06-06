@@ -7,6 +7,9 @@ export interface AggregateResult {
 	title: string;
 	// Markdown body for the check run's output.summary — the per-build breakdown.
 	summary: string;
+	// ISO timestamp of the earliest build start, used to set the check run's started_at so GitHub
+	// shows the total CI wall-clock as the run's duration. Undefined when no build reports timing.
+	startedAt?: string;
 }
 
 type SimpleState = "success" | "pending" | "failure";
@@ -132,6 +135,21 @@ function formatDuration(ms: number): string {
 	if (m < 60) return `${m}m ${s % 60}s`;
 	const h = Math.floor(m / 60);
 	return `${h}h ${m % 60}m`;
+}
+
+// ISO timestamp of the earliest build start across all entries, or undefined if none report timing.
+function earliestStart(entries: BuildEntry[]): string | undefined {
+	let best: string | undefined;
+	let bestMs = Infinity;
+	for (const e of entries) {
+		if (!e.startedAt) continue;
+		const t = Date.parse(e.startedAt);
+		if (!Number.isNaN(t) && t < bestMs) {
+			bestMs = t;
+			best = e.startedAt;
+		}
+	}
+	return best;
 }
 
 // Wall-clock time from the earliest build start to the latest build completion, when timing is
@@ -335,5 +353,6 @@ export async function computeAllBuildsState(
 		state,
 		title: renderTitle(state, failed.length, passed.length, entries.length),
 		summary: renderSummary(failed, pending, passed, failed.length > 0),
+		startedAt: earliestStart(entries),
 	};
 }

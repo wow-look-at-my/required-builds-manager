@@ -258,9 +258,12 @@ export default {
 				repo,
 				sha,
 				config.context,
-				status,
-				conclusion,
-				{ title: result.title, summary: result.summary },
+				{
+					status,
+					conclusion,
+					output: { title: result.title, summary: result.summary },
+					startedAt: result.startedAt,
+				},
 				appId,
 			);
 		} catch (err) {
