@@ -11,8 +11,8 @@ When any CI system reports a status, check run, or workflow run on a commit, thi
 3. Deduplicates them (by context for statuses, by name for check runs and workflow runs)
 4. Computes an aggregate state using a low-water-mark algorithm:
    - **failure** if any build failed
-   - **pending** if any build is still running
-   - **success** only if all builds passed
+   - **pending** if any build is still running, or if builds have been triggered but none have reported yet (fail closed -- the combined check never goes green before CI has actually run)
+   - **success** only if all reported builds passed
 5. Publishes the result as an "all-builds" check run
 
 ### Detailed failure reporting

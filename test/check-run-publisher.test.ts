@@ -136,14 +136,23 @@ describe("publishViaCoordinator (Durable Object)", () => {
 			JSON.stringify({ token: "cached-token", expiresAt: Math.floor(Date.now() / 1000) + 3600 }),
 		);
 
-		// One passing check run that belongs to OUR app id is filtered out of aggregation, leaving no
-		// pending/failed builds -> success. The same GET serves the pending find, the alarm's
-		// listCheckRuns, and the alarm's find-own-run lookup.
+		// At heal time the listing shows a REAL passing build (plus our own all-builds run, which is
+		// filtered out by app id) -> no pending/failed builds -> success, so the alarm resolves and
+		// clears. (An empty listing would now be pending -- fail closed -- and would re-arm instead.)
+		// The same GET serves the pending find, the alarm's listCheckRuns, and the alarm's
+		// find-own-run lookup.
 		let created = false;
 		fetchMock
 			.get("https://api.github.com")
 			.intercept({ path: /^\/repos\/o\/r\/commits\/heal-sha\/check-runs/, method: "GET" })
-			.reply(() => ({ statusCode: 200, data: { check_runs: created ? [{ id: 5, app: { id: 99999 } }] : [] } }))
+			.reply(() => ({
+				statusCode: 200,
+				data: {
+					check_runs: created
+						? [{ id: 5, app: { id: 99999 } }, { name: "build", status: "completed", conclusion: "success" }]
+						: [],
+				},
+			}))
 			.times(3);
 		fetchMock
 			.get("https://api.github.com")

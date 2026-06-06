@@ -142,14 +142,38 @@ describe("computeAllBuildsState", () => {
 		expect(result.title).toBe("1/1 builds passed");
 	});
 
-	it("no other statuses or check runs — a bare pending incoming reflects the empty listing", async () => {
-		// A bare pending event invents nothing: the listing is authoritative, and a real pending build
-		// would already appear in it. Trusting the event here is what left all-builds stuck "in
-		// progress" after the build had finished.
+	it("a bare pending incoming with an empty listing is pending, not a premature success", async () => {
+		// At the very start of CI the listings are momentarily empty while jobs register their check
+		// runs. Reporting success here would publish a COMPLETED check run that unblocks merge before
+		// any build has run -- and GitHub then freezes it green. Fail closed: stay pending.
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "ci");
 
-		expect(result.state).toBe("success");
+		expect(result.state).toBe("pending");
 		expect(result.title).toBe("No builds reported yet");
+	});
+
+	it("empty listing + an ignored incoming stays success (nothing relevant to wait for)", async () => {
+		// If the only thing that fired was an ignored build and the listing is empty, there is nothing
+		// relevant in flight, so success (not the fail-closed pending) is correct.
+		const config = { context: "all-builds", ignore: ["codecov/*"] };
+		const result = await computeAllBuildsState(
+			"token", "owner", "repo", "abc123", "pending", "codecov/patch", undefined, config,
+		);
+
+		expect(result.state).toBe("success");
+	});
+
+	it("a single freshly-queued check run (empty status list) is pending, not success", async () => {
+		// The exact premature-success window: one job has registered its check run as queued and nothing
+		// else has reported yet. queued -> pending, so all-builds must be pending, never a green that
+		// unblocks merge before the build runs.
+		mockedListCheckRuns.mockResolvedValue([
+			{ name: "build", status: "queued", conclusion: null },
+		]);
+
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "build");
+
+		expect(result.state).toBe("pending");
 	});
 
 	it("filters out all-builds status context", async () => {
@@ -704,13 +728,17 @@ describe("computeAllBuildsState", () => {
 			expect(result.state).toBe("success");
 		});
 
-		it("a pending workflow_run event with an empty listing invents nothing", async () => {
+		it("a pending workflow_run with an empty listing is pending (nothing green to wedge -- fail closed)", async () => {
+			// With NO builds in the listing there is no already-green build to drag backwards; the commit
+			// simply hasn't registered any builds yet, so pending (fail closed) is correct. The wedge
+			// protection that matters is the one above: a pending event must not pull a build the listing
+			// already shows as PASSED back to pending.
 			const result = await computeAllBuildsState(
 				"token", "owner", "repo", "abc123", "pending", "Pages", undefined, undefined,
 				{ kind: "workflow" },
 			);
 
-			expect(result.state).toBe("success");
+			expect(result.state).toBe("pending");
 		});
 
 		it("STILL folds in an incoming failure the listing has not yet indexed (lag)", async () => {

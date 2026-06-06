@@ -451,7 +451,27 @@ export async function computeAllBuildsState(
 	let state: AggregateResult["state"];
 	if (failed.length) state = "failure";
 	else if (pending.length) state = "pending";
-	else state = "success";
+	else if (passed.length) state = "success";
+	else {
+		// No build resolved to success/failure/pending — the aggregate is empty. This must NOT be
+		// reported as success. At the very start of CI the statuses/check-runs listings are momentarily
+		// empty (a job has triggered a webhook but not yet registered its check run), and reporting
+		// success here publishes a COMPLETED check run that unblocks merge before a single build has
+		// run. Worse, GitHub freezes a completed check run — a later PATCH can't move it back to
+		// in_progress — so once we wrongly go green we stay green (this is exactly how an all-builds run
+		// ended up completed/success with a "3/5 builds passed -- In progress (2)" body and a
+		// completed_at that predated its started_at). So fail CLOSED: an empty aggregate is pending.
+		//
+		// The one exception is when builds DID report but were all excluded by ignore patterns (or the
+		// triggering event itself is ignored): then there is genuinely nothing relevant to wait for and
+		// success is correct. We only reach this branch from a real webhook, so "nothing in the listing
+		// and the trigger wasn't ignored" means a real build is in flight but hasn't registered yet.
+		const listingHadBuilds =
+			statuses.some((s) => s.context !== contextName) ||
+			checkRuns.some((cr) => !(appId != null && cr.app?.id === appId)) ||
+			workflowRuns.length > 0;
+		state = listingHadBuilds || incomingIsIgnored ? "success" : "pending";
+	}
 
 	return {
 		state,
