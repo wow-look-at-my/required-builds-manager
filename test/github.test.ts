@@ -55,6 +55,44 @@ describe("publishCheckRun", () => {
 		expect(JSON.parse(postBody!).started_at).toBe("2026-06-06T05:00:00Z");
 	});
 
+	it("sets details_url to the commit's checks page on create (POST)", async () => {
+		let postBody: string | undefined;
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: /^\/repos\/o\/r\/commits\/sha-d\/check-runs/, method: "GET" })
+			.reply(200, { check_runs: [] });
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: "/repos/o/r/check-runs", method: "POST" })
+			.reply((opts) => {
+				postBody = String(opts.body);
+				return { statusCode: 201, data: { id: 1 } };
+			});
+
+		await publishCheckRun("token", "o", "r", "sha-d", "all-builds", { status: "completed", conclusion: "failure", output }, 99999);
+
+		expect(JSON.parse(postBody!).details_url).toBe("https://github.com/o/r/commit/sha-d/checks");
+	});
+
+	it("sets details_url to the commit's checks page on update (PATCH)", async () => {
+		let patchBody: string | undefined;
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: /^\/repos\/o\/r\/commits\/sha-d\/check-runs/, method: "GET" })
+			.reply(200, { check_runs: [{ id: 7, app: { id: 99999 } }] });
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: "/repos/o/r/check-runs/7", method: "PATCH" })
+			.reply((opts) => {
+				patchBody = String(opts.body);
+				return { statusCode: 200, data: { id: 7 } };
+			});
+
+		await publishCheckRun("token", "o", "r", "sha-d", "all-builds", { status: "completed", conclusion: "failure", output }, 99999);
+
+		expect(JSON.parse(patchBody!).details_url).toBe("https://github.com/o/r/commit/sha-d/checks");
+	});
+
 	it("updates our existing check run in place (PATCH) when one is found", async () => {
 		fetchMock
 			.get("https://api.github.com")
