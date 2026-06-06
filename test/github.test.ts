@@ -28,7 +28,31 @@ describe("publishCheckRun", () => {
 			.intercept({ path: "/repos/o/r/check-runs", method: "POST" })
 			.reply(201, { id: 1 });
 
-		await publishCheckRun("token", "o", "r", "sha1", "all-builds", "completed", "success", output, 99999);
+		await publishCheckRun("token", "o", "r", "sha1", "all-builds", { status: "completed", conclusion: "success", output }, 99999);
+	});
+
+	it("sends started_at so GitHub renders the run's duration as total CI time", async () => {
+		let postBody: string | undefined;
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: /^\/repos\/o\/r\/commits\/sha-t\/check-runs/, method: "GET" })
+			.reply(200, { check_runs: [] });
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: "/repos/o/r/check-runs", method: "POST" })
+			.reply((opts) => {
+				postBody = String(opts.body);
+				return { statusCode: 201, data: { id: 1 } };
+			});
+
+		await publishCheckRun("token", "o", "r", "sha-t", "all-builds", {
+			status: "completed",
+			conclusion: "success",
+			output,
+			startedAt: "2026-06-06T05:00:00Z",
+		}, 99999);
+
+		expect(JSON.parse(postBody!).started_at).toBe("2026-06-06T05:00:00Z");
 	});
 
 	it("updates our existing check run in place (PATCH) when one is found", async () => {
@@ -41,7 +65,7 @@ describe("publishCheckRun", () => {
 			.intercept({ path: "/repos/o/r/check-runs/7", method: "PATCH" })
 			.reply(200, { id: 7 });
 
-		await publishCheckRun("token", "o", "r", "sha1", "all-builds", "completed", "failure", output, 99999);
+		await publishCheckRun("token", "o", "r", "sha1", "all-builds", { status: "completed", conclusion: "failure", output }, 99999);
 	});
 
 	it("ignores a same-named check run from another app and creates our own", async () => {
@@ -54,7 +78,7 @@ describe("publishCheckRun", () => {
 			.intercept({ path: "/repos/o/r/check-runs", method: "POST" })
 			.reply(201, { id: 9 });
 
-		await publishCheckRun("token", "o", "r", "sha1", "all-builds", "completed", "success", output, 99999);
+		await publishCheckRun("token", "o", "r", "sha1", "all-builds", { status: "completed", conclusion: "success", output }, 99999);
 	});
 
 	it("throws when the publish request fails", async () => {
@@ -68,7 +92,7 @@ describe("publishCheckRun", () => {
 			.reply(403, "Resource not accessible by integration");
 
 		await expect(
-			publishCheckRun("token", "o", "r", "sha1", "all-builds", "completed", "success", output, 99999),
+			publishCheckRun("token", "o", "r", "sha1", "all-builds", { status: "completed", conclusion: "success", output }, 99999),
 		).rejects.toThrow(/publishing check run: 403/);
 	});
 });

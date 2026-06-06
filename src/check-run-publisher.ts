@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { publishCheckRun, type CheckRunOutput } from "./github";
+import { publishCheckRun, type CheckRunUpdate } from "./github";
 
 // Durable Object used purely to serialize check-run publishing per commit. GitHub has no
 // upsert-by-name for check runs, so without serialization, simultaneous build events (e.g. a whole
@@ -15,13 +15,11 @@ export class CheckRunPublisher extends DurableObject {
 		repo: string,
 		sha: string,
 		name: string,
-		status: "in_progress" | "completed",
-		conclusion: string | null,
-		output: CheckRunOutput,
+		update: CheckRunUpdate,
 		appId?: number,
 	): Promise<void> {
 		await this.ctx.blockConcurrencyWhile(async () => {
-			await publishCheckRun(token, owner, repo, sha, name, status, conclusion, output, appId);
+			await publishCheckRun(token, owner, repo, sha, name, update, appId);
 		});
 	}
 }
@@ -35,12 +33,10 @@ export async function publishViaCoordinator(
 	repo: string,
 	sha: string,
 	name: string,
-	status: "in_progress" | "completed",
-	conclusion: string | null,
-	output: CheckRunOutput,
+	update: CheckRunUpdate,
 	appId?: number,
 ): Promise<void> {
 	const id = namespace.idFromName(`${owner}/${repo}@${sha}`);
 	const stub = namespace.get(id);
-	await stub.publish(token, owner, repo, sha, name, status, conclusion, output, appId);
+	await stub.publish(token, owner, repo, sha, name, update, appId);
 }

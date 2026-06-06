@@ -7,6 +7,9 @@ export interface AggregateResult {
 	title: string;
 	// Markdown body for the check run's output.summary — the per-build breakdown.
 	summary: string;
+	// ISO timestamp of the earliest build start, used to set the check run's started_at so GitHub
+	// shows the total CI wall-clock as the run's duration. Undefined when no build reports timing.
+	startedAt?: string;
 }
 
 type SimpleState = "success" | "pending" | "failure";
@@ -21,6 +24,9 @@ interface BuildEntry {
 	detail?: string;
 	// Link to where the full error is visible (status target_url, check details_url, run html_url).
 	url?: string;
+	// ISO timestamps for timing (check runs and workflow runs carry these; statuses don't).
+	startedAt?: string;
+	completedAt?: string;
 }
 
 // Details carried over from the triggering webhook event, used to enrich (and, under API lag,
@@ -100,28 +106,77 @@ function truncate(s: string, max: number): string {
 	return s.length > max ? s.slice(0, Math.max(0, max - 3)) + "..." : s;
 }
 
-function kindLabel(kind: BuildKind): string {
-	return kind === "check" ? "check run" : kind === "workflow" ? "workflow" : "status";
+// Escape characters that would break Markdown link text / inline text, and collapse whitespace.
+// Underscores are intentionally not escaped: GFM does not emphasize intra-word underscores, so
+// common identifiers like `startup_failure` stay readable.
+function mdText(s: string): string {
+	return oneLine(s).replace(/([\\`*\[\]<>])/g, "\\$1");
 }
 
-// Render a build name as inline code so arbitrary names can't break the Markdown layout.
-function code(name: string): string {
-	const clean = oneLine(name).replace(/`/g, "'");
-	return clean ? "`" + clean + "`" : "_(unnamed)_";
+// A build name rendered as a Markdown link to its check run / build when we have a URL, otherwise as
+// plain (escaped) text. The destination is angle-bracketed so odd URL characters can't break it.
+function buildLabel(e: BuildEntry): string {
+	const text = mdText(e.name) || "(unnamed)";
+	return e.url ? `[${text}](<${e.url}>)` : text;
 }
 
 function renderItem(e: BuildEntry): string {
-	let line = `- ${code(e.name)} (${kindLabel(e.kind)})`;
+	let line = `- ${buildLabel(e)}`;
 	if (e.detail) {
-		line += ` -- ${truncate(oneLine(e.detail), 160)}`;
-	}
-	if (e.url) {
-		line += ` ([details](${e.url}))`;
+		line += ` -- ${mdText(truncate(oneLine(e.detail), 160))}`;
 	}
 	return line;
 }
 
-function renderSummary(failed: BuildEntry[], pending: BuildEntry[], passed: BuildEntry[]): string {
+function formatDuration(ms: number): string {
+	const s = Math.round(ms / 1000);
+	if (s < 60) return `${s}s`;
+	const m = Math.floor(s / 60);
+	if (m < 60) return `${m}m ${s % 60}s`;
+	const h = Math.floor(m / 60);
+	return `${h}h ${m % 60}m`;
+}
+
+// ISO timestamp of the earliest build start across all entries, or undefined if none report timing.
+function earliestStart(entries: BuildEntry[]): string | undefined {
+	let best: string | undefined;
+	let bestMs = Infinity;
+	for (const e of entries) {
+		if (!e.startedAt) continue;
+		const t = Date.parse(e.startedAt);
+		if (!Number.isNaN(t) && t < bestMs) {
+			bestMs = t;
+			best = e.startedAt;
+		}
+	}
+	return best;
+}
+
+// Wall-clock time from the earliest build start to the latest build completion, when timing is
+// available (check runs and workflow runs carry it; commit statuses don't).
+function totalTime(entries: BuildEntry[]): string | null {
+	let minStart = Infinity;
+	let maxEnd = -Infinity;
+	for (const e of entries) {
+		if (e.startedAt) {
+			const t = Date.parse(e.startedAt);
+			if (!Number.isNaN(t)) minStart = Math.min(minStart, t);
+		}
+		if (e.completedAt) {
+			const t = Date.parse(e.completedAt);
+			if (!Number.isNaN(t)) maxEnd = Math.max(maxEnd, t);
+		}
+	}
+	if (minStart === Infinity || maxEnd === -Infinity || maxEnd <= minStart) return null;
+	return formatDuration(maxEnd - minStart);
+}
+
+function renderSummary(
+	failed: BuildEntry[],
+	pending: BuildEntry[],
+	passed: BuildEntry[],
+	hasFailure: boolean,
+): string {
 	const parts: string[] = [];
 	if (failed.length) {
 		parts.push(`### :x: Failed (${failed.length})\n` + failed.map(renderItem).join("\n"));
@@ -129,32 +184,26 @@ function renderSummary(failed: BuildEntry[], pending: BuildEntry[], passed: Buil
 	if (pending.length) {
 		parts.push(`### :hourglass_flowing_sand: In progress (${pending.length})\n` + pending.map(renderItem).join("\n"));
 	}
-	if (passed.length) {
-		parts.push(`### :white_check_mark: Passed (${passed.length})\n` + passed.map((e) => `- ${code(e.name)}`).join("\n"));
+	// On failure, focus on what's broken -- don't list the passing builds.
+	if (passed.length && !hasFailure) {
+		parts.push(`### :white_check_mark: Passed (${passed.length})\n` + passed.map((e) => `- ${buildLabel(e)}`).join("\n"));
 	}
-	return parts.length ? parts.join("\n\n") : "No builds have reported for this commit yet.";
+	const body = parts.length ? parts.join("\n\n") : "No builds have reported for this commit yet.";
+	const total = totalTime([...failed, ...pending, ...passed]);
+	return total ? `${body}\n\n_Total time: ${total}_` : body;
 }
 
+// Title is an at-a-glance count: "2/3 builds passed" (grows as builds finish) or, on any failure,
+// "1/3 builds failed". The per-build detail and links live in the summary, not here.
 function renderTitle(
 	state: AggregateResult["state"],
-	failed: BuildEntry[],
-	pending: BuildEntry[],
+	failedCount: number,
+	passedCount: number,
+	total: number,
 ): string {
-	if (state === "failure") {
-		if (failed.length === 1) {
-			const f = failed[0];
-			const nm = oneLine(f.name) || "A build";
-			return truncate(f.detail ? `${nm} failed: ${oneLine(f.detail)}` : `${nm} failed`, 255);
-		}
-		return `${failed.length} builds failed`;
-	}
-	if (state === "pending") {
-		if (pending.length === 1) {
-			return truncate(`${oneLine(pending[0].name) || "A build"} in progress`, 255);
-		}
-		return pending.length ? `${pending.length} builds in progress` : "Builds in progress";
-	}
-	return "All builds passed";
+	if (total === 0) return "No builds reported yet";
+	if (state === "failure") return `${failedCount}/${total} builds failed`;
+	return `${passedCount}/${total} builds passed`;
 }
 
 // --- Aggregation ------------------------------------------------------------------------------
@@ -234,6 +283,8 @@ export async function computeAllBuildsState(
 			state: mapCheckRunState(cr.status, cr.conclusion),
 			detail: cr.output?.title ?? undefined,
 			url: cr.details_url ?? cr.html_url ?? undefined,
+			startedAt: cr.started_at ?? undefined,
+			completedAt: cr.completed_at ?? undefined,
 		});
 	}
 
@@ -256,6 +307,8 @@ export async function computeAllBuildsState(
 				// API (only GitHub's web UI), so surface the conclusion and link to the run.
 				detail: run.conclusion ?? undefined,
 				url: run.html_url ?? undefined,
+				startedAt: run.run_started_at ?? undefined,
+				completedAt: run.updated_at ?? undefined,
 			});
 		}
 	}
@@ -298,7 +351,8 @@ export async function computeAllBuildsState(
 
 	return {
 		state,
-		title: renderTitle(state, failed, pending),
-		summary: renderSummary(failed, pending, passed),
+		title: renderTitle(state, failed.length, passed.length, entries.length),
+		summary: renderSummary(failed, pending, passed, failed.length > 0),
+		startedAt: earliestStart(entries),
 	};
 }
