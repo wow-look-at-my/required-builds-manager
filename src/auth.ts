@@ -16,6 +16,10 @@ export async function getInstallationToken(
 	env: Pick<AppEnv, "GITHUB_APP_ID" | "GITHUB_APP_PRIVATE_KEY">,
 	installationId: number,
 	kv?: KVNamespace,
+	// Skip the caches and mint a brand-new token. Installation tokens capture the installation's
+	// permissions at creation time, so after a permissions change (e.g. approving `checks:write`) a
+	// cached token is stale and must be re-minted to pick up the new scope.
+	forceRefresh = false,
 ): Promise<string> {
 	if (!env.GITHUB_APP_PRIVATE_KEY) {
 		throw new Error("Missing GITHUB_APP_PRIVATE_KEY");
@@ -24,14 +28,14 @@ export async function getInstallationToken(
 	const now = Math.floor(Date.now() / 1000);
 	const kvKey = `installation-token:${installationId}`;
 
-	// Check in-memory cache first
-	const memCached = tokenCache.get(installationId);
+	// Check in-memory cache first (skipped on a forced refresh)
+	const memCached = forceRefresh ? undefined : tokenCache.get(installationId);
 	if (memCached && memCached.expiresAt - now > 300) {
 		return memCached.token;
 	}
 
-	// Check KV cache (shared across all isolates)
-	if (kv) {
+	// Check KV cache (shared across all isolates; skipped on a forced refresh)
+	if (kv && !forceRefresh) {
 		try {
 			const kvVal = await kv.get(kvKey, "json") as CachedToken | null;
 			if (kvVal && kvVal.expiresAt - now > 300) {

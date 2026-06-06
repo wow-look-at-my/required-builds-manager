@@ -1,4 +1,4 @@
-import { listStatuses, listCheckRuns, listWorkflowRuns, type WorkflowRun } from "./github";
+import { listStatuses, listCheckRuns, listWorkflowRuns, getWorkflowJob, type WorkflowRun } from "./github";
 import { type RepoConfig, matchesIgnorePattern } from "./config";
 
 export interface AggregateResult {
@@ -12,6 +12,15 @@ export interface AggregateResult {
 type SimpleState = "success" | "pending" | "failure";
 type BuildKind = "status" | "check" | "workflow";
 
+// A finer-grained state than SimpleState, used for the individual steps of a job so the breakdown
+// can distinguish "running now" from "queued" and "skipped" from "passed".
+type StepState = "passed" | "failed" | "running" | "queued" | "skipped";
+
+interface StepInfo {
+	name: string;
+	state: StepState;
+}
+
 // One row in the breakdown: a single build and what we know about it.
 interface BuildEntry {
 	name: string;
@@ -21,6 +30,22 @@ interface BuildEntry {
 	detail?: string;
 	// Link to where the full error is visible (status target_url, check details_url, run html_url).
 	url?: string;
+	// For an Actions check run that failed or is in progress: its individual steps, so the breakdown
+	// shows exactly which step failed or is currently running.
+	steps?: StepInfo[];
+}
+
+// Maps the aggregate's logical state onto a check run's status + conclusion. A pending aggregate is
+// an in-progress run (no conclusion yet); everything else is a completed run. An internal "error"
+// blocks (conclusion "failure"). Lives here (not in index.ts) so the reconciliation alarm in the
+// Durable Object can reuse it when it re-publishes.
+export function toCheckRunResult(state: AggregateResult["state"]): {
+	status: "in_progress" | "completed";
+	conclusion: string | null;
+} {
+	if (state === "pending") return { status: "in_progress", conclusion: null };
+	if (state === "success") return { status: "completed", conclusion: "success" };
+	return { status: "completed", conclusion: "failure" };
 }
 
 // Details carried over from the triggering webhook event, used to enrich (and, under API lag,
@@ -83,6 +108,46 @@ function mapWorkflowRunState(status: string, conclusion: string | null): SimpleS
 	}
 }
 
+// Maps a job step's status+conclusion to a StepState. Distinguishes running/queued/skipped so the
+// breakdown shows exactly what a job is doing, not just "pending".
+function mapStepState(status: string, conclusion: string | null): StepState {
+	if (status !== "completed") return status === "in_progress" ? "running" : "queued";
+	switch (conclusion) {
+		case "success":
+		case "neutral":
+			return "passed";
+		case "skipped":
+			return "skipped";
+		default:
+			// failure, cancelled, timed_out, action_required, etc.
+			return "failed";
+	}
+}
+
+function stepIcon(state: StepState): string {
+	switch (state) {
+		case "passed":
+			return ":white_check_mark:";
+		case "failed":
+			return ":x:";
+		case "running":
+			return ":arrows_counterclockwise:";
+		case "skipped":
+			return ":fast_forward:";
+		default:
+			return ":white_large_square:"; // queued / not started
+	}
+}
+
+// Pulls the Actions job id out of a check run's URL (.../actions/runs/<run>/job/<jobId>), so we can
+// fetch that job's steps. Returns null for non-Actions check runs (external apps) whose URLs don't
+// match — those simply get no step breakdown.
+function extractJobId(url?: string): number | null {
+	if (!url) return null;
+	const m = url.match(/\/job\/(\d+)/);
+	return m ? parseInt(m[1], 10) : null;
+}
+
 // failure < pending < success — lower rank is "worse". An incoming event may only pull a build's
 // state down (toward failure), never up: the deduped API listing is the source of truth for the
 // latest reported state, so a later "success" event never overrides a failure the API still shows.
@@ -117,6 +182,10 @@ function renderItem(e: BuildEntry): string {
 	}
 	if (e.url) {
 		line += ` ([details](${e.url}))`;
+	}
+	// Nest the job's individual steps so the breakdown shows exactly which step failed or is running.
+	if (e.steps?.length) {
+		line += "\n" + e.steps.map((s) => `  - ${stepIcon(s.state)} ${code(s.name)}`).join("\n");
 	}
 	return line;
 }
@@ -298,6 +367,27 @@ export async function computeAllBuildsState(
 			});
 		}
 	}
+
+	// Enrich each failed or in-progress Actions check run with its individual steps, so the breakdown
+	// shows exactly which step failed or is running — not just that the job is red/yellow. Best-effort
+	// and only for non-passed check runs (passed jobs collapse to a single line), so the extra API
+	// calls are few; any fetch failure just omits the steps for that job.
+	await Promise.all(
+		entries.map(async (e) => {
+			if (e.kind !== "check" || e.state === "success") return;
+			const jobId = extractJobId(e.url);
+			if (jobId == null) return;
+			try {
+				const job = await getWorkflowJob(token, owner, repo, jobId);
+				const steps = job?.steps
+					?.filter((s) => s.name)
+					.map((s) => ({ name: s.name, state: mapStepState(s.status, s.conclusion) }));
+				if (steps && steps.length) e.steps = steps;
+			} catch {
+				// Best-effort — leave this job without a step breakdown.
+			}
+		}),
+	);
 
 	// Compute low-water-mark.
 	const failed = entries.filter((e) => e.state === "failure");

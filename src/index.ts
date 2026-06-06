@@ -1,5 +1,5 @@
 import { verifySignature } from "./verify";
-import { computeAllBuildsState, type AggregateResult, type IncomingDetail } from "./aggregate";
+import { computeAllBuildsState, toCheckRunResult, type IncomingDetail } from "./aggregate";
 import { publishViaCoordinator, type CheckRunPublisher } from "./check-run-publisher";
 import { getInstallationToken } from "./auth";
 import { getRepoConfig } from "./config";
@@ -109,18 +109,6 @@ function mapWorkflowRunState(status: string, conclusion: string | null): string 
 		default:
 			return "pending";
 	}
-}
-
-// Maps the aggregate's logical state onto a check run's status + conclusion. A pending aggregate is
-// an in-progress run (no conclusion yet); everything else is a completed run. An internal "error"
-// blocks (conclusion "failure") just as the old error status did.
-function toCheckRunResult(state: AggregateResult["state"]): {
-	status: "in_progress" | "completed";
-	conclusion: string | null;
-} {
-	if (state === "pending") return { status: "in_progress", conclusion: null };
-	if (state === "success") return { status: "completed", conclusion: "success" };
-	return { status: "completed", conclusion: "failure" };
 }
 
 export default {
@@ -247,25 +235,49 @@ export default {
 		);
 
 		const { status, conclusion } = toCheckRunResult(result.state);
+		const output = { title: result.title, summary: result.summary };
 
-		try {
-			// Route through the per-commit Durable Object so simultaneous build events serialize and
-			// produce a single "all-builds" check run rather than duplicates.
-			await publishViaCoordinator(
+		// Route through the per-commit Durable Object so simultaneous build events serialize and
+		// produce a single "all-builds" check run rather than duplicates. installationId + the ignore
+		// patterns are passed so the DO's reconciliation alarm can mint a fresh token and re-aggregate
+		// later if a terminal event is missed (see CheckRunPublisher).
+		const doPublish = (tok: string) =>
+			publishViaCoordinator(
 				env.CHECK_RUN_PUBLISHER,
-				token,
+				tok,
 				owner,
 				repo,
 				sha,
 				config.context,
 				status,
 				conclusion,
-				{ title: result.title, summary: result.summary },
+				output,
 				appId,
+				installationId,
+				config.ignore,
 			);
+
+		try {
+			await doPublish(token);
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : "Unknown error";
-			return new Response(`Failed to publish check run: ${msg}`, { status: 502 });
+			// A 403 on publish almost always means the cached installation token predates a
+			// permissions change — GitHub bakes the installation's permissions into the token at mint
+			// time, so a token minted before `checks:write` was approved keeps getting 403 on writes
+			// even though reads (which it already had) still work. Force a brand-new token and retry
+			// once; this self-recovers the moment the permission is approved instead of waiting up to
+			// an hour for the cached token to expire. If it still fails, it's a real error.
+			if ((err as { status?: number }).status === 403) {
+				try {
+					const fresh = await getInstallationToken(env, installationId, env.TOKEN_CACHE, true);
+					await doPublish(fresh);
+				} catch (retryErr) {
+					const msg = retryErr instanceof Error ? retryErr.message : "Unknown error";
+					return new Response(`Failed to publish check run: ${msg}`, { status: 502 });
+				}
+			} else {
+				const msg = err instanceof Error ? err.message : "Unknown error";
+				return new Response(`Failed to publish check run: ${msg}`, { status: 502 });
+			}
 		}
 
 		return new Response(JSON.stringify({ state: result.state, title: result.title }), {

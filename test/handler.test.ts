@@ -13,6 +13,13 @@ vi.mock("../src/verify", () => ({
 
 vi.mock("../src/aggregate", () => ({
 	computeAllBuildsState: vi.fn(),
+	// Real mapping — the handler uses it to derive the published status/conclusion, which the
+	// publish assertions below check.
+	toCheckRunResult: (state: string) => {
+		if (state === "pending") return { status: "in_progress", conclusion: null };
+		if (state === "success") return { status: "completed", conclusion: "success" };
+		return { status: "completed", conclusion: "failure" };
+	},
 }));
 
 vi.mock("../src/check-run-publisher", () => ({
@@ -230,6 +237,8 @@ describe("worker fetch handler", () => {
 			"success",
 			{ title: "All builds passed", summary: "All builds passed." },
 			12345,
+			12345,
+			[],
 		);
 	});
 
@@ -272,6 +281,8 @@ describe("worker fetch handler", () => {
 			null,
 			{ title: "build in progress", summary: "..." },
 			12345,
+			12345,
+			[],
 		);
 	});
 
@@ -294,6 +305,8 @@ describe("worker fetch handler", () => {
 			"success",
 			{ title: "All builds passed", summary: "All builds passed." },
 			12345,
+			12345,
+			[],
 		);
 	});
 
@@ -304,6 +317,35 @@ describe("worker fetch handler", () => {
 
 		expect(res.status).toBe(502);
 		expect(await res.text()).toBe("Failed to publish check run: checks: write missing");
+	});
+
+	it("force-refreshes the token and retries once when publishing fails with 403", async () => {
+		// A 403 typically means the cached installation token predates a permissions change (GitHub
+		// snapshots permissions into the token at mint time). The handler should mint a fresh token
+		// and retry once — recovering immediately after `checks:write` is approved.
+		const forbidden = Object.assign(new Error("GitHub API error publishing check run: 403 Forbidden"), {
+			status: 403,
+		});
+		mockedPublishViaCoordinator.mockRejectedValueOnce(forbidden).mockResolvedValueOnce(undefined);
+
+		const res = await worker.fetch(makeRequest(statusPayload), env as any);
+
+		expect(res.status).toBe(200);
+		// Token minted twice: the normal cached lookup, then a forced (cache-skipping) refresh.
+		expect(mockedGetToken).toHaveBeenCalledTimes(2);
+		expect(mockedGetToken).toHaveBeenLastCalledWith(expect.anything(), 12345, expect.anything(), true);
+		expect(mockedPublishViaCoordinator).toHaveBeenCalledTimes(2);
+	});
+
+	it("returns 502 if a 403 persists even after the forced token refresh", async () => {
+		// A 403 that survives a fresh token is a real permission problem retrying can't fix.
+		const forbidden = Object.assign(new Error("403 Forbidden"), { status: 403 });
+		mockedPublishViaCoordinator.mockRejectedValue(forbidden);
+
+		const res = await worker.fetch(makeRequest(statusPayload), env as any);
+
+		expect(res.status).toBe(502);
+		expect(mockedGetToken).toHaveBeenCalledTimes(2);
 	});
 
 	it("returns 500 when token fetch fails", async () => {
@@ -536,6 +578,8 @@ describe("worker fetch handler", () => {
 			"failure",
 			{ title: "CI failed: startup_failure", summary: "..." },
 			12345,
+			12345,
+			[],
 		);
 	});
 

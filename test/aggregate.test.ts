@@ -6,12 +6,14 @@ vi.mock("../src/github", () => ({
 	listStatuses: vi.fn(),
 	listCheckRuns: vi.fn(),
 	listWorkflowRuns: vi.fn(),
+	getWorkflowJob: vi.fn(),
 	createCheckRun: vi.fn(),
 }));
 
 const mockedListStatuses = vi.mocked(github.listStatuses);
 const mockedListCheckRuns = vi.mocked(github.listCheckRuns);
 const mockedListWorkflowRuns = vi.mocked(github.listWorkflowRuns);
+const mockedGetWorkflowJob = vi.mocked(github.getWorkflowJob);
 
 describe("computeAllBuildsState", () => {
 	beforeEach(() => {
@@ -19,6 +21,8 @@ describe("computeAllBuildsState", () => {
 		mockedListStatuses.mockResolvedValue([]);
 		mockedListCheckRuns.mockResolvedValue([]);
 		mockedListWorkflowRuns.mockResolvedValue([]);
+		// Default: no step detail. Per-step tests override this.
+		mockedGetWorkflowJob.mockResolvedValue(null);
 	});
 
 	// An incoming failure no longer short-circuits — we always aggregate so the breakdown is
@@ -697,6 +701,84 @@ describe("computeAllBuildsState", () => {
 			expect(result.state).toBe("failure");
 			expect(result.title).toBe("CI failed: startup_failure");
 			expect(result.summary).toContain("(workflow)");
+		});
+	});
+
+	// Per-step breakdown: for a failed or in-progress Actions job, surface its individual steps so the
+	// summary shows exactly which step failed or is running.
+	describe("per-step breakdown for failed / in-progress jobs", () => {
+		const jobUrl = "https://github.com/o/r/actions/runs/123/job/456";
+
+		it("shows the individual steps of a failed job, flagging the failed step", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "failure", details_url: jobUrl },
+			]);
+			mockedGetWorkflowJob.mockResolvedValue({
+				steps: [
+					{ name: "Set up job", status: "completed", conclusion: "success", number: 1 },
+					{ name: "Run build", status: "completed", conclusion: "failure", number: 2 },
+					{ name: "Upload", status: "completed", conclusion: "skipped", number: 3 },
+				],
+			});
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+
+			expect(result.state).toBe("failure");
+			// The Actions job id is parsed from the check run URL.
+			expect(mockedGetWorkflowJob).toHaveBeenCalledWith("token", "owner", "repo", 456);
+			expect(result.summary).toContain("`Set up job`");
+			expect(result.summary).toContain(":x: `Run build`");
+		});
+
+		it("shows the currently running step of an in-progress job", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "deploy", status: "in_progress", conclusion: null, details_url: jobUrl },
+			]);
+			mockedGetWorkflowJob.mockResolvedValue({
+				steps: [
+					{ name: "Checkout", status: "completed", conclusion: "success", number: 1 },
+					{ name: "Deploy to Pages", status: "in_progress", conclusion: null, number: 2 },
+				],
+			});
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "deploy");
+
+			expect(result.state).toBe("pending");
+			expect(result.summary).toContain(":arrows_counterclockwise: `Deploy to Pages`");
+		});
+
+		it("does not fetch steps for passed jobs", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "success", details_url: jobUrl },
+			]);
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
+
+			expect(result.state).toBe("success");
+			expect(mockedGetWorkflowJob).not.toHaveBeenCalled();
+		});
+
+		it("does not fetch steps for a check run with no Actions job id in its URL", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "external", status: "completed", conclusion: "failure", details_url: "https://ci.example/build/9" },
+			]);
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+
+			expect(result.state).toBe("failure");
+			expect(mockedGetWorkflowJob).not.toHaveBeenCalled();
+		});
+
+		it("is best-effort: a failed step fetch just omits steps without failing aggregation", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "failure", details_url: jobUrl },
+			]);
+			mockedGetWorkflowJob.mockRejectedValue(new Error("boom"));
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+
+			expect(result.state).toBe("failure");
+			expect(result.summary).toContain("`build`");
 		});
 	});
 });

@@ -57,7 +57,7 @@ describe("publishCheckRun", () => {
 		await publishCheckRun("token", "o", "r", "sha1", "all-builds", "completed", "success", output, 99999);
 	});
 
-	it("throws when the publish request fails", async () => {
+	it("throws with the HTTP status attached when the publish request fails (403)", async () => {
 		fetchMock
 			.get("https://api.github.com")
 			.intercept({ path: /^\/repos\/o\/r\/commits\/sha1\/check-runs/, method: "GET" })
@@ -67,8 +67,13 @@ describe("publishCheckRun", () => {
 			.intercept({ path: "/repos/o/r/check-runs", method: "POST" })
 			.reply(403, "Resource not accessible by integration");
 
-		await expect(
-			publishCheckRun("token", "o", "r", "sha1", "all-builds", "completed", "success", output, 99999),
-		).rejects.toThrow(/publishing check run: 403/);
+		const err = (await publishCheckRun("token", "o", "r", "sha1", "all-builds", "completed", "success", output, 99999).catch(
+			(e) => e,
+		)) as Error & { status?: number };
+		expect(err).toBeInstanceOf(Error);
+		expect(err.message).toMatch(/publishing check run: 403/);
+		// The attached status is what lets the handler distinguish a stale-token 403 (retry with a
+		// fresh token) from other failures.
+		expect(err.status).toBe(403);
 	});
 });
