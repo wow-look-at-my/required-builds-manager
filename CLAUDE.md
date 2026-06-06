@@ -40,7 +40,7 @@ src/
 ├── auth.ts        # GitHub App JWT generation (RS256), installation token caching, PKCS#1/PKCS#8 key handling
 ├── config.ts      # Per-repo YAML config loading from .github/required-builds.yml (with org .github repo fallback)
 ├── fetch-retry.ts # Retry wrapper with exponential backoff for transient HTTP errors
-├── github.ts      # GitHub API client: listStatuses, listCheckRuns, listWorkflowRuns, createCheckRun (paginated)
+├── github.ts      # GitHub API client: listStatuses, listCheckRuns, listWorkflowRuns, publishCheckRun (create-or-update-in-place) (paginated)
 └── verify.ts      # HMAC-SHA256 webhook signature verification
 test/
 ├── handler.test.ts      # Handler integration tests
@@ -71,7 +71,7 @@ test/
 5. Fetch per-repo config from `.github/required-builds.yml` (falls back to org `.github` repo, then defaults)
 6. Loop prevention: skip a `check_run` event for our own combined check run (by `app.id`), and skip a `status` event whose context matches the configured name
 7. Aggregate: fetch all statuses + check-runs + workflow-runs for the SHA, deduplicate by context/name, filter out ignored patterns, collect each build's name/kind/state/detail/url, fold in the triggering event (low-water-mark only — an incoming event can pull a build's state down but never up, so a later success never overrides a failure the API still shows), compute the combined state, and render the Markdown title + summary
-8. POST the combined check run to GitHub using the configured name (`output.title` names the failing build(s); `output.summary` is the full breakdown). A `pending` aggregate is an `in_progress` run (no conclusion); success/failure/error are `completed` runs
+8. Publish the combined check run using the configured name (`output.title` names the failing build(s); `output.summary` is the full breakdown). `publishCheckRun` first looks up our existing run for the SHA (by name + our `app.id`) and PATCHes it in place, only POSTing a new one if none exists — so a commit shows a single `all-builds` entry that changes state, not a stack of duplicates. A `pending` aggregate is an `in_progress` run (no conclusion); success/failure/error are `completed` runs
 
 ### Key Design Decisions
 
@@ -80,6 +80,7 @@ test/
 - **Per-repo config**: `.github/required-builds.yml` supports custom context name and ignore patterns (glob); falls back to org `.github` repo, then defaults
 - **Output is a check run, not a status**: The combined result is published via `createCheckRun` so the `output.summary` Markdown can carry a full per-build breakdown — a commit-status `description` is capped at ~140 chars. `aggregate.ts` collects each build's name/kind/state/detail/url and renders: a `title` naming the failing build(s) (e.g. `lint failed: 3 errors`, or `2 builds failed`) and a `summary` grouping builds into Failed/In progress/Passed with links. Build names are wrapped in inline code so arbitrary names can't break the Markdown.
 - **No failure short-circuit**: Every event runs the full aggregation (the old "incoming failure → short-circuit without fetching" path was removed) so the breakdown always reflects all builds. The triggering event is still folded in for correctness under API lag, but only via low-water-mark (`rank`: failure < pending < success) — an incoming event can lower a build's state, never raise it.
+- **Single check run, updated in place**: Unlike commit statuses (which GitHub collapses by context), multiple check runs with the same name show side by side. So `publishCheckRun` finds our prior `all-builds` run for the SHA (by name + our `app.id`) and PATCHes it, only creating one when absent — one entry per commit that changes state. Caveat: this is best-effort, not atomic. Truly simultaneous events for the same SHA (e.g. a large matrix all finishing at once) can each find "none" and create duplicates, since Workers are stateless/concurrent and check runs have no upsert-by-name. A Durable Object could serialize publishing per SHA to make it exact; not currently implemented.
 - **Infinite loop prevention**: Our own combined check run fires a `check_run` event; `index.ts` skips it by matching `check_run.app.id` against the App's id (the same `appId` aggregation uses to filter our check run out of the listing). A leftover/foreign `status` whose context matches the configured name is also skipped.
 - **Deduplication**: Statuses deduplicated by `context`, check-runs and workflow-runs by `name` (API returns newest first)
 - **Check-run mapping**: `queued`/`in_progress` → pending; completed with `success`/`neutral`/`skipped` → success; `failure`/`timed_out`/`cancelled`/`action_required` → failure; `stale` → pending

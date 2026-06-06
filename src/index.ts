@@ -1,6 +1,6 @@
 import { verifySignature } from "./verify";
 import { computeAllBuildsState, type AggregateResult, type IncomingDetail } from "./aggregate";
-import { createCheckRun } from "./github";
+import { publishCheckRun } from "./github";
 import { getInstallationToken } from "./auth";
 import { getRepoConfig } from "./config";
 
@@ -244,7 +244,7 @@ export default {
 		const { status, conclusion } = toCheckRunResult(result.state);
 
 		try {
-			await createCheckRun(
+			await publishCheckRun(
 				token,
 				owner,
 				repo,
@@ -253,10 +253,11 @@ export default {
 				status,
 				conclusion,
 				{ title: result.title, summary: result.summary },
+				appId,
 			);
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : "Unknown error";
-			return new Response(`Failed to create check run: ${msg}`, { status: 502 });
+			return new Response(`Failed to publish check run: ${msg}`, { status: 502 });
 		}
 
 		return new Response(JSON.stringify({ state: result.state, title: result.title }), {

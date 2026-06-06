@@ -136,11 +136,46 @@ export async function listWorkflowRuns(
 	return all;
 }
 
+// Finds the id of the check run we previously published for this commit, matched by name AND our
+// app id. Used to update that run in place rather than stacking duplicate "all-builds" check runs
+// side by side on every event. Best-effort: returns null (-> create a fresh run) on any API error.
+async function findOwnCheckRunId(
+	token: string,
+	owner: string,
+	repo: string,
+	sha: string,
+	name: string,
+	appId?: number,
+): Promise<number | null> {
+	// The check-runs list endpoint supports a check_name filter, so this is a cheap, targeted lookup.
+	const url = `${GITHUB_API}/repos/${owner}/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}&per_page=100`;
+	const res = await fetchWithRetry(url, {
+		headers: {
+			Authorization: `token ${token}`,
+			Accept: "application/vnd.github+json",
+			"User-Agent": "required-builds-manager",
+		},
+	});
+
+	if (!res.ok) return null;
+
+	const data: { check_runs: { id: number; app?: { id: number } }[] } = await res.json();
+	// API returns newest first — reuse the most recent run created by our app.
+	for (const cr of data.check_runs) {
+		if (appId == null || cr.app?.id === appId) return cr.id;
+	}
+	return null;
+}
+
 // Publishes the combined result as a check run (rather than a commit status) so the
 // `output.summary` Markdown field can carry a full per-build breakdown — the commit-status
 // `description` is capped at ~140 chars. Creating check runs requires the GitHub App to hold
 // the `checks: write` permission.
-export async function createCheckRun(
+//
+// Updates our existing check run in place when one is found (so the commit shows a single
+// "all-builds" entry that changes state, like a re-run, instead of many duplicates); otherwise
+// creates a new one.
+export async function publishCheckRun(
 	token: string,
 	owner: string,
 	repo: string,
@@ -149,21 +184,30 @@ export async function createCheckRun(
 	status: "in_progress" | "completed",
 	conclusion: string | null,
 	output: CheckRunOutput,
+	appId?: number,
 ): Promise<void> {
-	const body: Record<string, unknown> = {
-		name,
-		head_sha: sha,
-		status,
-		output,
-	};
+	const existingId = await findOwnCheckRunId(token, owner, repo, sha, name, appId);
+
+	const body: Record<string, unknown> = { name, status, output };
 	// `conclusion` is required when (and only when) the run is completed.
 	if (status === "completed") {
 		body.conclusion = conclusion ?? "failure";
 	}
 
-	const url = `${GITHUB_API}/repos/${owner}/${repo}/check-runs`;
+	let url: string;
+	let method: string;
+	if (existingId != null) {
+		// Update the existing run. `head_sha` is fixed and must not be sent on update.
+		url = `${GITHUB_API}/repos/${owner}/${repo}/check-runs/${existingId}`;
+		method = "PATCH";
+	} else {
+		url = `${GITHUB_API}/repos/${owner}/${repo}/check-runs`;
+		method = "POST";
+		body.head_sha = sha;
+	}
+
 	const res = await fetchWithRetry(url, {
-		method: "POST",
+		method,
 		headers: {
 			Authorization: `token ${token}`,
 			Accept: "application/vnd.github+json",
@@ -174,6 +218,6 @@ export async function createCheckRun(
 	});
 
 	if (!res.ok) {
-		throw new Error(`GitHub API error creating check run: ${res.status} ${res.statusText}`);
+		throw new Error(`GitHub API error publishing check run: ${res.status} ${res.statusText}`);
 	}
 }

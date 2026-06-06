@@ -21,6 +21,8 @@ The check run doesn't just say pass/fail — its title names the specific build 
 
 For a `startup_failure` (invalid workflow YAML), GitHub exposes the validation message only in its web UI, not via the API — so the summary names the broken workflow and links to the run, where the full "Invalid workflow file..." text is shown.
 
+The worker updates a **single** `all-builds` check run in place as builds report (rather than stacking a new check run on every event), so each commit shows one entry whose state changes over time. Every individual workflow job already appears as its own check run, so the breakdown covers per-job state without subscribing to `workflow_job` events.
+
 ### Catching workflow startup failures
 
 When a workflow's YAML is invalid (or it otherwise fails before any job runs), GitHub records it as a `startup_failure` workflow run that produces **zero check runs and zero statuses** — invisible to the statuses and check-runs APIs. The worker also listens for `workflow_run` events and folds any `startup_failure` into the aggregate, so a broken workflow blocks the `all-builds` check instead of silently passing. (This requires the `Actions` read permission; if it's missing, the worker degrades gracefully and simply skips this check.)

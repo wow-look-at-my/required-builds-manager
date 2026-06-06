@@ -16,7 +16,7 @@ vi.mock("../src/aggregate", () => ({
 }));
 
 vi.mock("../src/github", () => ({
-	createCheckRun: vi.fn(),
+	publishCheckRun: vi.fn(),
 }));
 
 vi.mock("../src/auth", () => ({
@@ -29,7 +29,7 @@ vi.mock("../src/config", () => ({
 
 const mockedVerify = vi.mocked(verify.verifySignature);
 const mockedCompute = vi.mocked(aggregate.computeAllBuildsState);
-const mockedCreateCheckRun = vi.mocked(github.createCheckRun);
+const mockedPublishCheckRun = vi.mocked(github.publishCheckRun);
 const mockedGetToken = vi.mocked(auth.getInstallationToken);
 const mockedGetRepoConfig = vi.mocked(config.getRepoConfig);
 
@@ -121,7 +121,7 @@ describe("worker fetch handler", () => {
 		vi.clearAllMocks();
 		mockedVerify.mockResolvedValue(true);
 		mockedCompute.mockResolvedValue(okResult);
-		mockedCreateCheckRun.mockResolvedValue(undefined);
+		mockedPublishCheckRun.mockResolvedValue(undefined);
 		mockedGetToken.mockResolvedValue("test-installation-token");
 		mockedGetRepoConfig.mockResolvedValue(defaultConfig);
 	});
@@ -218,7 +218,7 @@ describe("worker fetch handler", () => {
 			defaultConfig,
 			expect.objectContaining({ kind: "status" }),
 		);
-		expect(mockedCreateCheckRun).toHaveBeenCalledWith(
+		expect(mockedPublishCheckRun).toHaveBeenCalledWith(
 			"test-installation-token",
 			"myorg",
 			"myrepo",
@@ -227,6 +227,7 @@ describe("worker fetch handler", () => {
 			"completed",
 			"success",
 			{ title: "All builds passed", summary: "All builds passed." },
+			12345,
 		);
 	});
 
@@ -258,7 +259,7 @@ describe("worker fetch handler", () => {
 		const res = await worker.fetch(req, env as any);
 
 		expect(res.status).toBe(200);
-		expect(mockedCreateCheckRun).toHaveBeenCalledWith(
+		expect(mockedPublishCheckRun).toHaveBeenCalledWith(
 			"test-installation-token",
 			"myorg",
 			"myrepo",
@@ -267,6 +268,7 @@ describe("worker fetch handler", () => {
 			"in_progress",
 			null,
 			{ title: "build in progress", summary: "..." },
+			12345,
 		);
 	});
 
@@ -278,7 +280,7 @@ describe("worker fetch handler", () => {
 		const res = await worker.fetch(req, env as any);
 
 		expect(res.status).toBe(200);
-		expect(mockedCreateCheckRun).toHaveBeenCalledWith(
+		expect(mockedPublishCheckRun).toHaveBeenCalledWith(
 			"test-installation-token",
 			"myorg",
 			"myrepo",
@@ -287,16 +289,17 @@ describe("worker fetch handler", () => {
 			"completed",
 			"success",
 			{ title: "All builds passed", summary: "All builds passed." },
+			12345,
 		);
 	});
 
-	it("returns 502 when check run creation fails", async () => {
-		mockedCreateCheckRun.mockRejectedValue(new Error("checks: write missing"));
+	it("returns 502 when check run publishing fails", async () => {
+		mockedPublishCheckRun.mockRejectedValue(new Error("checks: write missing"));
 		const req = makeRequest(statusPayload);
 		const res = await worker.fetch(req, env as any);
 
 		expect(res.status).toBe(502);
-		expect(await res.text()).toBe("Failed to create check run: checks: write missing");
+		expect(await res.text()).toBe("Failed to publish check run: checks: write missing");
 	});
 
 	it("returns 500 when token fetch fails", async () => {
@@ -339,7 +342,7 @@ describe("worker fetch handler", () => {
 		expect(res.status).toBe(200);
 		expect(await res.text()).toBe("Ignored own check run");
 		expect(mockedCompute).not.toHaveBeenCalled();
-		expect(mockedCreateCheckRun).not.toHaveBeenCalled();
+		expect(mockedPublishCheckRun).not.toHaveBeenCalled();
 	});
 
 	it("does not skip a check run from a different app", async () => {
@@ -518,7 +521,7 @@ describe("worker fetch handler", () => {
 			defaultConfig,
 			expect.objectContaining({ kind: "workflow", detail: "startup_failure" }),
 		);
-		expect(mockedCreateCheckRun).toHaveBeenCalledWith(
+		expect(mockedPublishCheckRun).toHaveBeenCalledWith(
 			"test-installation-token",
 			"myorg",
 			"myrepo",
@@ -527,6 +530,7 @@ describe("worker fetch handler", () => {
 			"completed",
 			"failure",
 			{ title: "CI failed: startup_failure", summary: "..." },
+			12345,
 		);
 	});
 
