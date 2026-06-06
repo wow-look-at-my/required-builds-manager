@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { fetchMock } from "cloudflare:test";
-import { generateJwt, getInstallationToken, tokenCache } from "../src/auth";
+import { generateJwt, getInstallationToken, getInstallationId, tokenCache } from "../src/auth";
 
 const TEST_PRIVATE_KEY = `-----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCtHggT701TddZa
@@ -154,5 +154,37 @@ describe("getInstallationToken", () => {
 			.reply(404, "Not Found");
 
 		await expect(getInstallationToken(env, 99999)).rejects.toThrow("Failed to get installation token: 404");
+	});
+});
+
+describe("getInstallationId", () => {
+	const env = { GITHUB_APP_ID: "12345", GITHUB_APP_PRIVATE_KEY: TEST_PRIVATE_KEY };
+
+	beforeEach(() => {
+		fetchMock.activate();
+		fetchMock.disableNetConnect();
+	});
+
+	afterEach(() => {
+		fetchMock.deactivate();
+	});
+
+	it("resolves the installation id for a repo", async () => {
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: "/repos/o/r/installation", method: "GET" })
+			.reply(200, JSON.stringify({ id: 424242 }), { headers: { "content-type": "application/json" } });
+
+		const id = await getInstallationId(env, "o", "r");
+		expect(id).toBe(424242);
+	});
+
+	it("throws on API error", async () => {
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: "/repos/o/missing/installation", method: "GET" })
+			.reply(404, "Not Found");
+
+		await expect(getInstallationId(env, "o", "missing")).rejects.toThrow("Failed to get installation id: 404");
 	});
 });

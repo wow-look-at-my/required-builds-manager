@@ -55,6 +55,17 @@ export interface CheckRunUpdate {
 	startedAt?: string;
 }
 
+export interface StatusUpdate {
+	// Commit-status states map 1:1 to the aggregate's states. Unlike a completed check run, a status
+	// can move freely between these on every event (GitHub keeps the latest per context).
+	state: "success" | "pending" | "failure" | "error";
+	// Short headline (GitHub caps the status description at ~140 chars). The full per-build breakdown
+	// lives behind targetUrl.
+	description: string;
+	// The capability URL for the self-hosted breakdown page (the status's "Details" link).
+	targetUrl: string;
+}
+
 import { fetchWithRetry } from "./fetch-retry";
 
 const GITHUB_API = "https://api.github.com";
@@ -278,6 +289,47 @@ export async function publishCheckRun(
 		// Attach the HTTP status so callers can distinguish a permanent permission error (403 — the
 		// app's installation lacks an approved `checks:write`) from a transient one worth retrying.
 		const err = new Error(`GitHub API error publishing check run: ${res.status} ${res.statusText}`) as Error & {
+			status?: number;
+		};
+		err.status = res.status;
+		throw err;
+	}
+}
+
+// Publishes the combined result as a COMMIT STATUS (not a check run). GitHub keeps the latest status
+// per context and lets it move freely between states on every event, so all-builds can return to
+// pending/failure after a success when a new build appears for the same SHA -- something a completed
+// check run cannot do (GitHub freezes a completed check run's conclusion). The rich per-build breakdown
+// is served separately from our own /b/ route and linked via target_url. Requires `statuses: write`.
+export async function publishStatus(
+	token: string,
+	owner: string,
+	repo: string,
+	sha: string,
+	context: string,
+	update: StatusUpdate,
+): Promise<void> {
+	const res = await fetchWithRetry(`${GITHUB_API}/repos/${owner}/${repo}/statuses/${sha}`, {
+		method: "POST",
+		headers: {
+			Authorization: `token ${token}`,
+			Accept: "application/vnd.github+json",
+			"User-Agent": "required-builds-manager",
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({
+			state: update.state,
+			context,
+			// GitHub caps the status description at ~140 chars.
+			description: update.description.slice(0, 140),
+			target_url: update.targetUrl,
+		}),
+	});
+
+	if (!res.ok) {
+		// Attach the HTTP status so callers can distinguish a stale-token 403 (retry with a fresh
+		// token) from other failures -- the same recovery the check-run path used.
+		const err = new Error(`GitHub API error publishing status: ${res.status} ${res.statusText}`) as Error & {
 			status?: number;
 		};
 		err.status = res.status;
