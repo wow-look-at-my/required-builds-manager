@@ -21,7 +21,7 @@ The check run doesn't just say pass/fail — its title names the specific build 
 
 For a `startup_failure` (invalid workflow YAML), GitHub exposes the validation message only in its web UI, not via the API — so the summary names the broken workflow and links to the run, where the full "Invalid workflow file..." text is shown.
 
-The worker updates a **single** `all-builds` check run in place as builds report (rather than stacking a new check run on every event), so each commit shows one entry whose state changes over time. Every individual workflow job already appears as its own check run, so the breakdown covers per-job state without subscribing to `workflow_job` events.
+The worker updates a **single** `all-builds` check run in place as builds report (rather than stacking a new check run on every event), so each commit shows one entry whose state changes over time. To keep this exact even when many builds finish at once (e.g. a large matrix), publishing for a given commit is serialized through a per-commit Durable Object — so concurrent events can't race into duplicate check runs. Every individual workflow job already appears as its own check run, so the breakdown covers per-job state without subscribing to `workflow_job` events.
 
 ### Catching workflow startup failures
 
@@ -81,7 +81,7 @@ npx tsc --noEmit    # Type-check
 
 ### Tech Stack
 
-- **Runtime**: [Cloudflare Workers](https://workers.cloudflare.com/)
+- **Runtime**: [Cloudflare Workers](https://workers.cloudflare.com/) + a [Durable Object](https://developers.cloudflare.com/durable-objects/) (per-commit publish serialization)
 - **Language**: TypeScript (strict mode)
 - **Testing**: [Vitest](https://vitest.dev/) with [@cloudflare/vitest-pool-workers](https://developers.cloudflare.com/workers/testing/vitest-integration/)
 
@@ -89,12 +89,13 @@ npx tsc --noEmit    # Type-check
 
 ```
 src/
-├── index.ts       # Worker entry point and webhook handler
-├── aggregate.ts   # Build state aggregation logic
-├── auth.ts        # GitHub App authentication (JWT, installation tokens)
-├── config.ts      # Per-repo YAML config loading (with org fallback)
-├── github.ts      # GitHub API client (statuses, check runs, workflow runs)
-└── verify.ts      # Webhook signature verification
+├── index.ts               # Worker entry point and webhook handler
+├── aggregate.ts           # Build state aggregation + Markdown breakdown
+├── check-run-publisher.ts # Durable Object that serializes publishing per commit
+├── auth.ts                # GitHub App authentication (JWT, installation tokens)
+├── config.ts              # Per-repo YAML config loading (with org fallback)
+├── github.ts              # GitHub API client (statuses, check runs, workflow runs)
+└── verify.ts              # Webhook signature verification
 ```
 
 ## Deployment

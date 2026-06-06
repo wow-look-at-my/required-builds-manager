@@ -1,14 +1,19 @@
 import { verifySignature } from "./verify";
 import { computeAllBuildsState, type AggregateResult, type IncomingDetail } from "./aggregate";
-import { publishCheckRun } from "./github";
+import { publishViaCoordinator, type CheckRunPublisher } from "./check-run-publisher";
 import { getInstallationToken } from "./auth";
 import { getRepoConfig } from "./config";
+
+// The Durable Object class must be exported from the Worker's entry module so the runtime can
+// instantiate it (see the durable_objects binding in wrangler.jsonc).
+export { CheckRunPublisher } from "./check-run-publisher";
 
 interface Env {
 	GITHUB_APP_ID: string;
 	GITHUB_APP_PRIVATE_KEY: string;
 	WEBHOOK_SECRET: string;
 	TOKEN_CACHE?: KVNamespace;
+	CHECK_RUN_PUBLISHER: DurableObjectNamespace<CheckRunPublisher>;
 }
 
 interface StatusEvent {
@@ -244,7 +249,10 @@ export default {
 		const { status, conclusion } = toCheckRunResult(result.state);
 
 		try {
-			await publishCheckRun(
+			// Route through the per-commit Durable Object so simultaneous build events serialize and
+			// produce a single "all-builds" check run rather than duplicates.
+			await publishViaCoordinator(
+				env.CHECK_RUN_PUBLISHER,
 				token,
 				owner,
 				repo,

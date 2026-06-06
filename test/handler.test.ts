@@ -3,7 +3,7 @@ import { env } from "cloudflare:test";
 import worker from "../src/index";
 import * as verify from "../src/verify";
 import * as aggregate from "../src/aggregate";
-import * as github from "../src/github";
+import * as coordinator from "../src/check-run-publisher";
 import * as auth from "../src/auth";
 import * as config from "../src/config";
 
@@ -15,8 +15,9 @@ vi.mock("../src/aggregate", () => ({
 	computeAllBuildsState: vi.fn(),
 }));
 
-vi.mock("../src/github", () => ({
-	publishCheckRun: vi.fn(),
+vi.mock("../src/check-run-publisher", () => ({
+	publishViaCoordinator: vi.fn(),
+	CheckRunPublisher: class {},
 }));
 
 vi.mock("../src/auth", () => ({
@@ -29,7 +30,7 @@ vi.mock("../src/config", () => ({
 
 const mockedVerify = vi.mocked(verify.verifySignature);
 const mockedCompute = vi.mocked(aggregate.computeAllBuildsState);
-const mockedPublishCheckRun = vi.mocked(github.publishCheckRun);
+const mockedPublishViaCoordinator = vi.mocked(coordinator.publishViaCoordinator);
 const mockedGetToken = vi.mocked(auth.getInstallationToken);
 const mockedGetRepoConfig = vi.mocked(config.getRepoConfig);
 
@@ -121,7 +122,7 @@ describe("worker fetch handler", () => {
 		vi.clearAllMocks();
 		mockedVerify.mockResolvedValue(true);
 		mockedCompute.mockResolvedValue(okResult);
-		mockedPublishCheckRun.mockResolvedValue(undefined);
+		mockedPublishViaCoordinator.mockResolvedValue(undefined);
 		mockedGetToken.mockResolvedValue("test-installation-token");
 		mockedGetRepoConfig.mockResolvedValue(defaultConfig);
 	});
@@ -218,7 +219,8 @@ describe("worker fetch handler", () => {
 			defaultConfig,
 			expect.objectContaining({ kind: "status" }),
 		);
-		expect(mockedPublishCheckRun).toHaveBeenCalledWith(
+		expect(mockedPublishViaCoordinator).toHaveBeenCalledWith(
+			(env as unknown as { CHECK_RUN_PUBLISHER: unknown }).CHECK_RUN_PUBLISHER,
 			"test-installation-token",
 			"myorg",
 			"myrepo",
@@ -259,7 +261,8 @@ describe("worker fetch handler", () => {
 		const res = await worker.fetch(req, env as any);
 
 		expect(res.status).toBe(200);
-		expect(mockedPublishCheckRun).toHaveBeenCalledWith(
+		expect(mockedPublishViaCoordinator).toHaveBeenCalledWith(
+			(env as unknown as { CHECK_RUN_PUBLISHER: unknown }).CHECK_RUN_PUBLISHER,
 			"test-installation-token",
 			"myorg",
 			"myrepo",
@@ -280,7 +283,8 @@ describe("worker fetch handler", () => {
 		const res = await worker.fetch(req, env as any);
 
 		expect(res.status).toBe(200);
-		expect(mockedPublishCheckRun).toHaveBeenCalledWith(
+		expect(mockedPublishViaCoordinator).toHaveBeenCalledWith(
+			(env as unknown as { CHECK_RUN_PUBLISHER: unknown }).CHECK_RUN_PUBLISHER,
 			"test-installation-token",
 			"myorg",
 			"myrepo",
@@ -294,7 +298,7 @@ describe("worker fetch handler", () => {
 	});
 
 	it("returns 502 when check run publishing fails", async () => {
-		mockedPublishCheckRun.mockRejectedValue(new Error("checks: write missing"));
+		mockedPublishViaCoordinator.mockRejectedValue(new Error("checks: write missing"));
 		const req = makeRequest(statusPayload);
 		const res = await worker.fetch(req, env as any);
 
@@ -342,7 +346,7 @@ describe("worker fetch handler", () => {
 		expect(res.status).toBe(200);
 		expect(await res.text()).toBe("Ignored own check run");
 		expect(mockedCompute).not.toHaveBeenCalled();
-		expect(mockedPublishCheckRun).not.toHaveBeenCalled();
+		expect(mockedPublishViaCoordinator).not.toHaveBeenCalled();
 	});
 
 	it("does not skip a check run from a different app", async () => {
@@ -521,7 +525,8 @@ describe("worker fetch handler", () => {
 			defaultConfig,
 			expect.objectContaining({ kind: "workflow", detail: "startup_failure" }),
 		);
-		expect(mockedPublishCheckRun).toHaveBeenCalledWith(
+		expect(mockedPublishViaCoordinator).toHaveBeenCalledWith(
+			(env as unknown as { CHECK_RUN_PUBLISHER: unknown }).CHECK_RUN_PUBLISHER,
 			"test-installation-token",
 			"myorg",
 			"myrepo",

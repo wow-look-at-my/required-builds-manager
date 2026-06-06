@@ -35,25 +35,28 @@ If you are tempted to do any of the above because "the pipeline looks broken": s
 
 ```
 src/
-├── index.ts       # Worker entry point — POST webhook handler, event routing, incoming-detail extraction, check-run/workflow-run state mapping, self-loop guard (skip own check run by app.id), publishes the combined check run
+├── index.ts       # Worker entry point — POST webhook handler, event routing, incoming-detail extraction, check-run/workflow-run state mapping, self-loop guard (skip own check run by app.id), routes publishing through the Durable Object; also re-exports the DO class
 ├── aggregate.ts   # Low-water-mark aggregation: fetches all statuses + check-runs + workflow-runs, deduplicates, computes combined state, and renders the per-build Markdown breakdown (title + summary)
+├── check-run-publisher.ts # CheckRunPublisher Durable Object (serializes publishing per commit via blockConcurrencyWhile) + publishViaCoordinator helper (routes by owner/repo@sha)
 ├── auth.ts        # GitHub App JWT generation (RS256), installation token caching, PKCS#1/PKCS#8 key handling
 ├── config.ts      # Per-repo YAML config loading from .github/required-builds.yml (with org .github repo fallback)
 ├── fetch-retry.ts # Retry wrapper with exponential backoff for transient HTTP errors
 ├── github.ts      # GitHub API client: listStatuses, listCheckRuns, listWorkflowRuns, publishCheckRun (create-or-update-in-place) (paginated)
 └── verify.ts      # HMAC-SHA256 webhook signature verification
 test/
-├── handler.test.ts      # Handler integration tests
-├── aggregate.test.ts    # Aggregation logic tests
-├── auth.test.ts         # JWT and token caching tests
-├── config.test.ts       # Config parsing, glob matching, and fetching tests
-├── fetch-retry.test.ts  # Retry logic tests
-└── verify.test.ts       # Signature verification tests
+├── handler.test.ts             # Handler integration tests
+├── aggregate.test.ts           # Aggregation logic tests
+├── github.test.ts              # publishCheckRun create-vs-update routing tests
+├── check-run-publisher.test.ts # Durable Object publish + concurrency serialization tests
+├── auth.test.ts                # JWT and token caching tests
+├── config.test.ts              # Config parsing, glob matching, and fetching tests
+├── fetch-retry.test.ts         # Retry logic tests
+└── verify.test.ts              # Signature verification tests
 ```
 
 ## Tech Stack
 
-- **Runtime**: Cloudflare Workers (ESNext, no Node.js APIs)
+- **Runtime**: Cloudflare Workers (ESNext, no Node.js APIs) + one Durable Object (`CheckRunPublisher`) used as a per-commit serialization lock
 - **Language**: TypeScript 5 with strict mode
 - **Build/Deploy**: Wrangler 4
 - **Testing**: Vitest 3 with `@cloudflare/vitest-pool-workers` (runs tests inside the Workers runtime)
@@ -71,7 +74,7 @@ test/
 5. Fetch per-repo config from `.github/required-builds.yml` (falls back to org `.github` repo, then defaults)
 6. Loop prevention: skip a `check_run` event for our own combined check run (by `app.id`), and skip a `status` event whose context matches the configured name
 7. Aggregate: fetch all statuses + check-runs + workflow-runs for the SHA, deduplicate by context/name, filter out ignored patterns, collect each build's name/kind/state/detail/url, fold in the triggering event (low-water-mark only — an incoming event can pull a build's state down but never up, so a later success never overrides a failure the API still shows), compute the combined state, and render the Markdown title + summary
-8. Publish the combined check run using the configured name (`output.title` names the failing build(s); `output.summary` is the full breakdown). `publishCheckRun` first looks up our existing run for the SHA (by name + our `app.id`) and PATCHes it in place, only POSTing a new one if none exists — so a commit shows a single `all-builds` entry that changes state, not a stack of duplicates. A `pending` aggregate is an `in_progress` run (no conclusion); success/failure/error are `completed` runs
+8. Publish the combined check run using the configured name (`output.title` names the failing build(s); `output.summary` is the full breakdown), routed through the per-commit Durable Object (`publishViaCoordinator` → `CheckRunPublisher`). `publishCheckRun` first looks up our existing run for the SHA (by name + our `app.id`) and PATCHes it in place, only POSTing a new one if none exists — so a commit shows a single `all-builds` entry that changes state, not a stack of duplicates. A `pending` aggregate is an `in_progress` run (no conclusion); success/failure/error are `completed` runs
 
 ### Key Design Decisions
 
@@ -80,7 +83,8 @@ test/
 - **Per-repo config**: `.github/required-builds.yml` supports custom context name and ignore patterns (glob); falls back to org `.github` repo, then defaults
 - **Output is a check run, not a status**: The combined result is published via `createCheckRun` so the `output.summary` Markdown can carry a full per-build breakdown — a commit-status `description` is capped at ~140 chars. `aggregate.ts` collects each build's name/kind/state/detail/url and renders: a `title` naming the failing build(s) (e.g. `lint failed: 3 errors`, or `2 builds failed`) and a `summary` grouping builds into Failed/In progress/Passed with links. Build names are wrapped in inline code so arbitrary names can't break the Markdown.
 - **No failure short-circuit**: Every event runs the full aggregation (the old "incoming failure → short-circuit without fetching" path was removed) so the breakdown always reflects all builds. The triggering event is still folded in for correctness under API lag, but only via low-water-mark (`rank`: failure < pending < success) — an incoming event can lower a build's state, never raise it.
-- **Single check run, updated in place**: Unlike commit statuses (which GitHub collapses by context), multiple check runs with the same name show side by side. So `publishCheckRun` finds our prior `all-builds` run for the SHA (by name + our `app.id`) and PATCHes it, only creating one when absent — one entry per commit that changes state. Caveat: this is best-effort, not atomic. Truly simultaneous events for the same SHA (e.g. a large matrix all finishing at once) can each find "none" and create duplicates, since Workers are stateless/concurrent and check runs have no upsert-by-name. A Durable Object could serialize publishing per SHA to make it exact; not currently implemented.
+- **Single check run, updated in place**: Unlike commit statuses (which GitHub collapses by context), multiple check runs with the same name show side by side. So `publishCheckRun` finds our prior `all-builds` run for the SHA (by name + our `app.id`) and PATCHes it, only creating one when absent — one entry per commit that changes state.
+- **Per-commit serialization (Durable Object)**: find-or-create is not atomic, so truly simultaneous events for the same SHA (e.g. a large matrix all finishing at once) could each find "none" and create duplicates — and check runs can't be deleted. To make it exact, every publish is routed through the `CheckRunPublisher` Durable Object, keyed by `owner/repo@sha`, which wraps the find-or-update in `ctx.blockConcurrencyWhile` so events for one commit serialize: the first creates the run, the rest update it. The DO holds no persistent state (the lookup re-queries GitHub each time), so it's purely a per-commit lock. Declared in `wrangler.jsonc` as a `new_sqlite_classes` migration (works on the Workers free plan too).
 - **Infinite loop prevention**: Our own combined check run fires a `check_run` event; `index.ts` skips it by matching `check_run.app.id` against the App's id (the same `appId` aggregation uses to filter our check run out of the listing). A leftover/foreign `status` whose context matches the configured name is also skipped.
 - **Deduplication**: Statuses deduplicated by `context`, check-runs and workflow-runs by `name` (API returns newest first)
 - **Check-run mapping**: `queued`/`in_progress` → pending; completed with `success`/`neutral`/`skipped` → success; `failure`/`timed_out`/`cancelled`/`action_required` → failure; `stale` → pending
@@ -102,6 +106,12 @@ Set as Cloudflare Worker secrets (never commit these):
 | Binding | Description |
 |---|---|
 | `TOKEN_CACHE` | KV namespace for caching GitHub installation tokens across isolates (optional -- falls back to in-memory) |
+
+### Durable Object Bindings
+
+| Binding | Class | Description |
+|---|---|---|
+| `CHECK_RUN_PUBLISHER` | `CheckRunPublisher` | Serializes check-run publishing per commit (keyed by `owner/repo@sha`) so concurrent build events produce one `all-builds` run, not duplicates. Declared via a `new_sqlite_classes` migration in `wrangler.jsonc`. |
 
 ## Testing
 
