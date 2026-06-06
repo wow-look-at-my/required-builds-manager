@@ -3,26 +3,14 @@ import { type RepoConfig, matchesIgnorePattern } from "./config";
 
 export interface AggregateResult {
 	state: "success" | "pending" | "failure" | "error";
-	// Short headline for the check run's output.title (GitHub caps this at 255 chars).
+	// Short headline for the commit status's description (GitHub caps it at ~140 chars).
 	title: string;
-	// Markdown body for the check run's output.summary — the per-build breakdown.
-	summary: string;
-	// ISO timestamp of the earliest build start, used to set the check run's started_at so GitHub
-	// shows the total CI wall-clock as the run's duration. Undefined when no build reports timing.
+	// The per-build breakdown, grouped for the self-hosted page. All empty for an "error" result.
+	failed: BuildEntry[];
+	pending: BuildEntry[];
+	passed: BuildEntry[];
+	// ISO timestamp of the earliest build start, used by the breakdown page's "Total time" line.
 	startedAt?: string;
-}
-
-// Maps the aggregate's logical state onto a check run's status + conclusion. A pending aggregate is
-// an in-progress run (no conclusion yet); everything else is a completed run. An internal "error"
-// blocks (conclusion "failure"). Lives here (not in index.ts) so the reconciliation alarm in the
-// Durable Object can reuse it when it re-publishes.
-export function toCheckRunResult(state: AggregateResult["state"]): {
-	status: "in_progress" | "completed";
-	conclusion: string | null;
-} {
-	if (state === "pending") return { status: "in_progress", conclusion: null };
-	if (state === "success") return { status: "completed", conclusion: "success" };
-	return { status: "completed", conclusion: "failure" };
 }
 
 type SimpleState = "success" | "pending" | "failure";
@@ -30,15 +18,15 @@ type BuildKind = "status" | "check" | "workflow";
 
 // A finer-grained state than SimpleState, used for the individual steps of a job so the breakdown
 // can distinguish "running now" from "queued" and "skipped" from "passed".
-type StepState = "passed" | "failed" | "running" | "queued" | "skipped";
+export type StepState = "passed" | "failed" | "running" | "queued" | "skipped";
 
-interface StepInfo {
+export interface StepInfo {
 	name: string;
 	state: StepState;
 }
 
 // One row in the breakdown: a single build and what we know about it.
-interface BuildEntry {
+export interface BuildEntry {
 	name: string;
 	kind: BuildKind;
 	state: SimpleState;
@@ -137,21 +125,6 @@ function mapStepState(status: string, conclusion: string | null): StepState {
 	}
 }
 
-function stepIcon(state: StepState): string {
-	switch (state) {
-		case "passed":
-			return ":white_check_mark:";
-		case "failed":
-			return ":x:";
-		case "running":
-			return ":arrows_counterclockwise:";
-		case "skipped":
-			return ":fast_forward:";
-		default:
-			return ":white_large_square:"; // queued / not started
-	}
-}
-
 // Pulls the Actions job id out of a check run's URL (.../actions/runs/<run>/job/<jobId>), so we can
 // fetch that job's steps. Returns null for non-Actions check runs (external apps) whose URLs don't
 // match — those simply get no step breakdown.
@@ -161,52 +134,8 @@ function extractJobId(url?: string): number | null {
 	return m ? parseInt(m[1], 10) : null;
 }
 
-// --- Markdown rendering -----------------------------------------------------------------------
-
-function oneLine(s: string): string {
-	return s.replace(/\s+/g, " ").trim();
-}
-
-function truncate(s: string, max: number): string {
-	return s.length > max ? s.slice(0, Math.max(0, max - 3)) + "..." : s;
-}
-
-// Escape characters that would break Markdown link text / inline text, and collapse whitespace.
-// Underscores are intentionally not escaped: GFM does not emphasize intra-word underscores, so
-// common identifiers like `startup_failure` stay readable.
-function mdText(s: string): string {
-	return oneLine(s).replace(/([\\`*\[\]<>])/g, "\\$1");
-}
-
-// A build name rendered as a Markdown link to its check run / build when we have a URL, otherwise as
-// plain (escaped) text. The destination is angle-bracketed so odd URL characters can't break it.
-function buildLabel(e: BuildEntry): string {
-	const text = mdText(e.name) || "(unnamed)";
-	return e.url ? `[${text}](<${e.url}>)` : text;
-}
-
-function renderItem(e: BuildEntry): string {
-	let line = `- ${buildLabel(e)}`;
-	if (e.detail) {
-		line += ` -- ${mdText(truncate(oneLine(e.detail), 160))}`;
-	}
-	// Nest the job's individual steps so the breakdown shows exactly which step failed or is running.
-	if (e.steps?.length) {
-		line += "\n" + e.steps.map((s) => `  - ${stepIcon(s.state)} ${mdText(s.name)}`).join("\n");
-	}
-	return line;
-}
-
-function formatDuration(ms: number): string {
-	const s = Math.round(ms / 1000);
-	if (s < 60) return `${s}s`;
-	const m = Math.floor(s / 60);
-	if (m < 60) return `${m}m ${s % 60}s`;
-	const h = Math.floor(m / 60);
-	return `${h}h ${m % 60}m`;
-}
-
 // ISO timestamp of the earliest build start across all entries, or undefined if none report timing.
+// Used by the breakdown page to show total CI wall-clock.
 function earliestStart(entries: BuildEntry[]): string | undefined {
 	let best: string | undefined;
 	let bestMs = Infinity;
@@ -221,49 +150,8 @@ function earliestStart(entries: BuildEntry[]): string | undefined {
 	return best;
 }
 
-// Wall-clock time from the earliest build start to the latest build completion, when timing is
-// available (check runs and workflow runs carry it; commit statuses don't).
-function totalTime(entries: BuildEntry[]): string | null {
-	let minStart = Infinity;
-	let maxEnd = -Infinity;
-	for (const e of entries) {
-		if (e.startedAt) {
-			const t = Date.parse(e.startedAt);
-			if (!Number.isNaN(t)) minStart = Math.min(minStart, t);
-		}
-		if (e.completedAt) {
-			const t = Date.parse(e.completedAt);
-			if (!Number.isNaN(t)) maxEnd = Math.max(maxEnd, t);
-		}
-	}
-	if (minStart === Infinity || maxEnd === -Infinity || maxEnd <= minStart) return null;
-	return formatDuration(maxEnd - minStart);
-}
-
-function renderSummary(
-	failed: BuildEntry[],
-	pending: BuildEntry[],
-	passed: BuildEntry[],
-	hasFailure: boolean,
-): string {
-	const parts: string[] = [];
-	if (failed.length) {
-		parts.push(`### :x: Failed (${failed.length})\n` + failed.map(renderItem).join("\n"));
-	}
-	if (pending.length) {
-		parts.push(`### :hourglass_flowing_sand: In progress (${pending.length})\n` + pending.map(renderItem).join("\n"));
-	}
-	// On failure, focus on what's broken -- don't list the passing builds.
-	if (passed.length && !hasFailure) {
-		parts.push(`### :white_check_mark: Passed (${passed.length})\n` + passed.map((e) => `- ${buildLabel(e)}`).join("\n"));
-	}
-	const body = parts.length ? parts.join("\n\n") : "No builds have reported for this commit yet.";
-	const total = totalTime([...failed, ...pending, ...passed]);
-	return total ? `${body}\n\n_Total time: ${total}_` : body;
-}
-
 // Title is an at-a-glance count: "2/3 builds passed" (grows as builds finish) or, on any failure,
-// "1/3 builds failed". The per-build detail and links live in the summary, not here.
+// "1/3 builds failed". The per-build detail and links live on the breakdown page, not here.
 function renderTitle(
 	state: AggregateResult["state"],
 	failedCount: number,
@@ -312,15 +200,16 @@ export async function computeAllBuildsState(
 		return {
 			state: "error",
 			title: "Could not aggregate builds",
-			summary: "Failed to fetch build statuses from the GitHub API. This will be retried on the next build event.",
+			failed: [],
+			pending: [],
+			passed: [],
 		};
 	}
 
 	const entries: BuildEntry[] = [];
 
 	// Deduplicate statuses by context — newest first from API. Skip our own combined context so a
-	// stale all-builds status (e.g. left over from before this app published a check run) can't
-	// feed back into the aggregate.
+	// stale all-builds status can't feed back into the aggregate.
 	const seenContexts = new Set<string>();
 	for (const s of statuses) {
 		if (s.context === contextName) continue;
@@ -337,9 +226,10 @@ export async function computeAllBuildsState(
 	}
 
 	// Deduplicate check runs by name — take first occurrence.
-	// Filter out check runs created by our own app (identified by app.id) to prevent self-loops —
-	// this is how our own combined check run is excluded. Unlike statuses, we don't filter by name:
-	// that would let someone bypass the system by naming their check run "all-builds".
+	// Filter out check runs created by our own app (identified by app.id) to prevent self-loops, and
+	// to ignore any leftover all-builds check run from before this app switched to commit statuses.
+	// Unlike statuses, we don't filter by name: that would let someone bypass the system by naming
+	// their check run "all-builds".
 	const seenNames = new Set<string>();
 	for (const cr of checkRuns) {
 		if (appId != null && cr.app?.id === appId) continue;
@@ -451,12 +341,31 @@ export async function computeAllBuildsState(
 	let state: AggregateResult["state"];
 	if (failed.length) state = "failure";
 	else if (pending.length) state = "pending";
-	else state = "success";
+	else if (passed.length) state = "success";
+	else {
+		// No build resolved to success/failure/pending — the aggregate is empty. This must NOT be
+		// reported as success. At the very start of CI the statuses/check-runs listings are momentarily
+		// empty (a job has triggered a webhook but not yet registered its check run), and reporting
+		// success there marks the combined result green before a single build has run. So fail CLOSED:
+		// an empty aggregate is pending.
+		//
+		// The one exception is when builds DID report but were all excluded by ignore patterns (or the
+		// triggering event itself is ignored): then there is genuinely nothing relevant to wait for and
+		// success is correct. We only reach this branch from a real webhook, so "nothing in the listing
+		// and the trigger wasn't ignored" means a real build is in flight but hasn't registered yet.
+		const listingHadBuilds =
+			statuses.some((s) => s.context !== contextName) ||
+			checkRuns.some((cr) => !(appId != null && cr.app?.id === appId)) ||
+			workflowRuns.length > 0;
+		state = listingHadBuilds || incomingIsIgnored ? "success" : "pending";
+	}
 
 	return {
 		state,
 		title: renderTitle(state, failed.length, passed.length, entries.length),
-		summary: renderSummary(failed, pending, passed, failed.length > 0),
+		failed,
+		pending,
+		passed,
 		startedAt: earliestStart(entries),
 	};
 }

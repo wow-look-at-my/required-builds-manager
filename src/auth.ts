@@ -82,6 +82,32 @@ export async function getInstallationToken(
 	return data.token;
 }
 
+// Resolves the installation id for a repo using an App JWT. The webhook path reads the installation id
+// straight from the event payload, but the breakdown page (a plain GET with no webhook payload) has to
+// look it up so it can mint a token and aggregate.
+export async function getInstallationId(
+	env: Pick<AppEnv, "GITHUB_APP_ID" | "GITHUB_APP_PRIVATE_KEY">,
+	owner: string,
+	repo: string,
+): Promise<number> {
+	const jwt = await generateJwt(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY);
+
+	const res = await fetchWithRetry(`https://api.github.com/repos/${owner}/${repo}/installation`, {
+		headers: {
+			Authorization: `Bearer ${jwt}`,
+			Accept: "application/vnd.github+json",
+			"User-Agent": "required-builds-manager",
+		},
+	});
+
+	if (!res.ok) {
+		throw new Error(`Failed to get installation id: ${res.status} ${res.statusText}`);
+	}
+
+	const data: { id: number } = await res.json();
+	return data.id;
+}
+
 export async function generateJwt(appId: string, privateKeyPem: string): Promise<string> {
 	const now = Math.floor(Date.now() / 1000);
 

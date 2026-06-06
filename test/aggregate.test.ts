@@ -31,8 +31,8 @@ describe("computeAllBuildsState", () => {
 
 		expect(result.state).toBe("failure");
 		expect(result.title).toBe("1/1 builds failed");
-		expect(result.summary).toContain("Failed (1)");
-		expect(result.summary).toContain("ci/tests");
+		expect(result.failed).toHaveLength(1);
+		expect(result.failed[0].name).toBe("ci/tests");
 		expect(mockedListStatuses).toHaveBeenCalled();
 	});
 
@@ -53,7 +53,7 @@ describe("computeAllBuildsState", () => {
 
 		expect(result.state).toBe("success");
 		expect(result.title).toBe("2/2 builds passed");
-		expect(result.summary).toContain("Passed (2)");
+		expect(result.passed).toHaveLength(2);
 	});
 
 	it("mixed pending statuses — title shows progress", async () => {
@@ -66,7 +66,7 @@ describe("computeAllBuildsState", () => {
 
 		expect(result.state).toBe("pending");
 		expect(result.title).toBe("1/2 builds passed");
-		expect(result.summary).toContain("In progress (1)");
+		expect(result.pending).toHaveLength(1);
 	});
 
 	it("mixed failure in existing statuses — counts failures, hides the passing one", async () => {
@@ -79,9 +79,9 @@ describe("computeAllBuildsState", () => {
 
 		expect(result.state).toBe("failure");
 		expect(result.title).toBe("1/2 builds failed");
-		expect(result.summary).toContain("Failed (1)");
-		// On failure we do not list the passing builds.
-		expect(result.summary).not.toContain("Passed");
+		expect(result.failed).toHaveLength(1);
+		// The passing build is still aggregated (the page just omits it on failure).
+		expect(result.passed).toHaveLength(1);
 	});
 
 	it("renders a status description as the failure detail, with the name linked", async () => {
@@ -93,8 +93,9 @@ describe("computeAllBuildsState", () => {
 
 		expect(result.state).toBe("failure");
 		expect(result.title).toBe("1/2 builds failed");
-		expect(result.summary).toContain("3 tests failed");
-		expect(result.summary).toContain("[ci/tests](<https://ci.example/run/1>)");
+		expect(result.failed[0].name).toBe("ci/tests");
+		expect(result.failed[0].detail).toBe("3 tests failed");
+		expect(result.failed[0].url).toBe("https://ci.example/run/1");
 	});
 
 	it("pending incoming does NOT drag a build the listing shows as passed back to pending", async () => {
@@ -142,14 +143,38 @@ describe("computeAllBuildsState", () => {
 		expect(result.title).toBe("1/1 builds passed");
 	});
 
-	it("no other statuses or check runs — a bare pending incoming reflects the empty listing", async () => {
-		// A bare pending event invents nothing: the listing is authoritative, and a real pending build
-		// would already appear in it. Trusting the event here is what left all-builds stuck "in
-		// progress" after the build had finished.
+	it("a bare pending incoming with an empty listing is pending, not a premature success", async () => {
+		// At the very start of CI the listings are momentarily empty while jobs register their check
+		// runs. Reporting success here would publish a COMPLETED check run that unblocks merge before
+		// any build has run -- and GitHub then freezes it green. Fail closed: stay pending.
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "ci");
 
-		expect(result.state).toBe("success");
+		expect(result.state).toBe("pending");
 		expect(result.title).toBe("No builds reported yet");
+	});
+
+	it("empty listing + an ignored incoming stays success (nothing relevant to wait for)", async () => {
+		// If the only thing that fired was an ignored build and the listing is empty, there is nothing
+		// relevant in flight, so success (not the fail-closed pending) is correct.
+		const config = { context: "all-builds", ignore: ["codecov/*"] };
+		const result = await computeAllBuildsState(
+			"token", "owner", "repo", "abc123", "pending", "codecov/patch", undefined, config,
+		);
+
+		expect(result.state).toBe("success");
+	});
+
+	it("a single freshly-queued check run (empty status list) is pending, not success", async () => {
+		// The exact premature-success window: one job has registered its check run as queued and nothing
+		// else has reported yet. queued -> pending, so all-builds must be pending, never a green that
+		// unblocks merge before the build runs.
+		mockedListCheckRuns.mockResolvedValue([
+			{ name: "build", status: "queued", conclusion: null },
+		]);
+
+		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "build");
+
+		expect(result.state).toBe("pending");
 	});
 
 	it("filters out all-builds status context", async () => {
@@ -245,8 +270,9 @@ describe("computeAllBuildsState", () => {
 
 		expect(result.state).toBe("failure");
 		expect(result.title).toBe("1/2 builds failed");
-		expect(result.summary).toContain("compile error in main.ts");
-		expect(result.summary).toContain("[build](<https://gh.example/runs/9>)");
+		expect(result.failed[0].name).toBe("build");
+		expect(result.failed[0].detail).toBe("compile error in main.ts");
+		expect(result.failed[0].url).toBe("https://gh.example/runs/9");
 	});
 
 	it("check run timed_out maps to failure", async () => {
@@ -413,9 +439,8 @@ describe("computeAllBuildsState", () => {
 
 		expect(result.state).toBe("failure");
 		expect(result.title).toBe("2/3 builds failed");
-		expect(result.summary).toContain("Failed (2)");
-		expect(result.summary).toContain("lint");
-		expect(result.summary).toContain("build");
+		expect(result.failed).toHaveLength(2);
+		expect(result.failed.map((b) => b.name).sort()).toEqual(["build", "lint"]);
 	});
 
 	it("returns error when check runs fetch fails", async () => {
@@ -426,7 +451,7 @@ describe("computeAllBuildsState", () => {
 		expect(result.state).toBe("error");
 	});
 
-	it("shows total CI time in the summary when builds carry timing", async () => {
+	it("exposes build timing (startedAt + completedAt) for the breakdown page's total time", async () => {
 		mockedListCheckRuns.mockResolvedValue([
 			{
 				name: "build",
@@ -439,7 +464,8 @@ describe("computeAllBuildsState", () => {
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
 
-		expect(result.summary).toContain("Total time: 2m 30s");
+		expect(result.startedAt).toBe("2026-06-06T05:00:00Z");
+		expect(result.passed[0].completedAt).toBe("2026-06-06T05:02:30Z");
 	});
 
 	// Incoming detail (from the webhook event) is used when the build is not yet in the listing.
@@ -452,18 +478,19 @@ describe("computeAllBuildsState", () => {
 
 		expect(result.state).toBe("failure");
 		expect(result.title).toBe("1/1 builds failed");
-		expect(result.summary).toContain("[deploy](<https://gh.example/runs/42>)");
-		expect(result.summary).toContain("exit code 1");
+		expect(result.failed[0].name).toBe("deploy");
+		expect(result.failed[0].url).toBe("https://gh.example/runs/42");
+		expect(result.failed[0].detail).toBe("exit code 1");
 	});
 
-	it("escapes Markdown-significant characters in build names", async () => {
+	it("keeps build names raw (escaping happens at render time)", async () => {
 		mockedListStatuses.mockResolvedValue([
 			{ state: "failure", context: "we`ird", id: 1 },
 		]);
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
 
-		expect(result.summary).toContain("we\\`ird");
+		expect(result.failed[0].name).toBe("we`ird");
 	});
 
 	// Ignore pattern tests
@@ -533,7 +560,9 @@ describe("computeAllBuildsState", () => {
 			);
 
 			expect(result.state).toBe("success");
-			expect(result.summary).toContain("No builds");
+			expect(result.failed).toHaveLength(0);
+			expect(result.pending).toHaveLength(0);
+			expect(result.passed).toHaveLength(0);
 		});
 
 		it("non-matching patterns do not affect aggregation", async () => {
@@ -577,8 +606,10 @@ describe("computeAllBuildsState", () => {
 
 			expect(result.state).toBe("failure");
 			expect(result.title).toBe("1/2 builds failed");
-			expect(result.summary).toContain("startup_failure");
-			expect(result.summary).toContain("[CI](<https://gh.example/run/7>)");
+			const ci = result.failed.find((b) => b.name === "CI")!;
+			expect(ci).toBeDefined();
+			expect(ci.detail).toBe("startup_failure");
+			expect(ci.url).toBe("https://gh.example/run/7");
 		});
 
 		it("startup_failure with no other builds — pure invalid-YAML commit", async () => {
@@ -704,13 +735,17 @@ describe("computeAllBuildsState", () => {
 			expect(result.state).toBe("success");
 		});
 
-		it("a pending workflow_run event with an empty listing invents nothing", async () => {
+		it("a pending workflow_run with an empty listing is pending (nothing green to wedge -- fail closed)", async () => {
+			// With NO builds in the listing there is no already-green build to drag backwards; the commit
+			// simply hasn't registered any builds yet, so pending (fail closed) is correct. The wedge
+			// protection that matters is the one above: a pending event must not pull a build the listing
+			// already shows as PASSED back to pending.
 			const result = await computeAllBuildsState(
 				"token", "owner", "repo", "abc123", "pending", "Pages", undefined, undefined,
 				{ kind: "workflow" },
 			);
 
-			expect(result.state).toBe("success");
+			expect(result.state).toBe("pending");
 		});
 
 		it("STILL folds in an incoming failure the listing has not yet indexed (lag)", async () => {
@@ -723,7 +758,7 @@ describe("computeAllBuildsState", () => {
 
 			expect(result.state).toBe("failure");
 			expect(result.title).toBe("1/1 builds failed");
-			expect(result.summary).toContain("startup_failure");
+			expect(result.failed[0].detail).toBe("startup_failure");
 		});
 	});
 
@@ -749,8 +784,11 @@ describe("computeAllBuildsState", () => {
 			expect(result.state).toBe("failure");
 			// The Actions job id is parsed from the check run URL.
 			expect(mockedGetWorkflowJob).toHaveBeenCalledWith("token", "owner", "repo", 456);
-			expect(result.summary).toContain("Set up job");
-			expect(result.summary).toContain(":x: Run build");
+			expect(result.failed[0].steps).toEqual([
+				{ name: "Set up job", state: "passed" },
+				{ name: "Run build", state: "failed" },
+				{ name: "Upload", state: "skipped" },
+			]);
 		});
 
 		it("shows the currently running step of an in-progress job", async () => {
@@ -767,7 +805,10 @@ describe("computeAllBuildsState", () => {
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "deploy");
 
 			expect(result.state).toBe("pending");
-			expect(result.summary).toContain(":arrows_counterclockwise: Deploy to Pages");
+			expect(result.pending[0].steps).toEqual([
+				{ name: "Checkout", state: "passed" },
+				{ name: "Deploy to Pages", state: "running" },
+			]);
 		});
 
 		it("does not fetch steps for passed jobs", async () => {
@@ -801,7 +842,8 @@ describe("computeAllBuildsState", () => {
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
 
 			expect(result.state).toBe("failure");
-			expect(result.summary).toContain("build");
+			expect(result.failed[0].name).toBe("build");
+			expect(result.failed[0].steps).toBeUndefined();
 		});
 	});
 });
