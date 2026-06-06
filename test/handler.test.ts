@@ -16,7 +16,7 @@ vi.mock("../src/aggregate", () => ({
 }));
 
 vi.mock("../src/github", () => ({
-	createStatus: vi.fn(),
+	createCheckRun: vi.fn(),
 }));
 
 vi.mock("../src/auth", () => ({
@@ -29,11 +29,12 @@ vi.mock("../src/config", () => ({
 
 const mockedVerify = vi.mocked(verify.verifySignature);
 const mockedCompute = vi.mocked(aggregate.computeAllBuildsState);
-const mockedCreateStatus = vi.mocked(github.createStatus);
+const mockedCreateCheckRun = vi.mocked(github.createCheckRun);
 const mockedGetToken = vi.mocked(auth.getInstallationToken);
 const mockedGetRepoConfig = vi.mocked(config.getRepoConfig);
 
 const defaultConfig = { context: "all-builds", ignore: [] };
+const okResult = { state: "success" as const, title: "All builds passed", summary: "All builds passed." };
 
 function makeRequest(
 	body: object,
@@ -119,8 +120,8 @@ describe("worker fetch handler", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		mockedVerify.mockResolvedValue(true);
-		mockedCompute.mockResolvedValue({ state: "success", description: "All builds passed" });
-		mockedCreateStatus.mockResolvedValue(undefined);
+		mockedCompute.mockResolvedValue(okResult);
+		mockedCreateCheckRun.mockResolvedValue(undefined);
 		mockedGetToken.mockResolvedValue("test-installation-token");
 		mockedGetRepoConfig.mockResolvedValue(defaultConfig);
 	});
@@ -191,7 +192,7 @@ describe("worker fetch handler", () => {
 		expect(await res.text()).toBe("Missing installation ID in webhook payload");
 	});
 
-	it("processes a valid status event", async () => {
+	it("processes a valid status event and publishes a check run", async () => {
 		const req = makeRequest(statusPayload);
 		const res = await worker.fetch(req, env as any);
 
@@ -215,19 +216,61 @@ describe("worker fetch handler", () => {
 			"ci/tests",
 			12345,
 			defaultConfig,
+			expect.objectContaining({ kind: "status" }),
 		);
-		expect(mockedCreateStatus).toHaveBeenCalledWith(
+		expect(mockedCreateCheckRun).toHaveBeenCalledWith(
 			"test-installation-token",
 			"myorg",
 			"myrepo",
 			"abc123def",
-			"success",
 			"all-builds",
-			"All builds passed",
+			"completed",
+			"success",
+			{ title: "All builds passed", summary: "All builds passed." },
 		);
 	});
 
-	it("uses custom context from config when creating status", async () => {
+	it("passes the incoming status description and target_url as detail", async () => {
+		const req = makeRequest({
+			...statusPayload,
+			state: "failure",
+			description: "build broke",
+			target_url: "https://ci.example/1",
+		});
+		await worker.fetch(req, env as any);
+
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"failure",
+			"ci/tests",
+			12345,
+			defaultConfig,
+			{ kind: "status", detail: "build broke", url: "https://ci.example/1" },
+		);
+	});
+
+	it("publishes an in_progress check run with no conclusion for a pending aggregate", async () => {
+		mockedCompute.mockResolvedValue({ state: "pending", title: "build in progress", summary: "..." });
+		const req = makeRequest(statusPayload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCreateCheckRun).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"all-builds",
+			"in_progress",
+			null,
+			{ title: "build in progress", summary: "..." },
+		);
+	});
+
+	it("uses custom context from config as the check run name", async () => {
 		const customConfig = { context: "combined-ci", ignore: [] };
 		mockedGetRepoConfig.mockResolvedValue(customConfig);
 
@@ -235,15 +278,25 @@ describe("worker fetch handler", () => {
 		const res = await worker.fetch(req, env as any);
 
 		expect(res.status).toBe(200);
-		expect(mockedCreateStatus).toHaveBeenCalledWith(
+		expect(mockedCreateCheckRun).toHaveBeenCalledWith(
 			"test-installation-token",
 			"myorg",
 			"myrepo",
 			"abc123def",
-			"success",
 			"combined-ci",
-			"All builds passed",
+			"completed",
+			"success",
+			{ title: "All builds passed", summary: "All builds passed." },
 		);
+	});
+
+	it("returns 502 when check run creation fails", async () => {
+		mockedCreateCheckRun.mockRejectedValue(new Error("checks: write missing"));
+		const req = makeRequest(statusPayload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(502);
+		expect(await res.text()).toBe("Failed to create check run: checks: write missing");
 	});
 
 	it("returns 500 when token fetch fails", async () => {
@@ -271,6 +324,59 @@ describe("worker fetch handler", () => {
 			"build",
 			12345,
 			defaultConfig,
+			expect.objectContaining({ kind: "check" }),
+		);
+	});
+
+	it("skips our own combined check run by app.id (loop prevention)", async () => {
+		const payload = {
+			...checkRunPayload,
+			check_run: { ...checkRunPayload.check_run, name: "all-builds", app: { id: 12345 } },
+		};
+		const req = makeCheckRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe("Ignored own check run");
+		expect(mockedCompute).not.toHaveBeenCalled();
+		expect(mockedCreateCheckRun).not.toHaveBeenCalled();
+	});
+
+	it("does not skip a check run from a different app", async () => {
+		const payload = {
+			...checkRunPayload,
+			check_run: { ...checkRunPayload.check_run, app: { id: 67890 } },
+		};
+		const req = makeCheckRunRequest(payload);
+		const res = await worker.fetch(req, env as any);
+
+		expect(res.status).toBe(200);
+		expect(mockedCompute).toHaveBeenCalled();
+	});
+
+	it("passes check run output title and details_url as incoming detail", async () => {
+		const payload = {
+			...checkRunPayload,
+			check_run: {
+				...checkRunPayload.check_run,
+				conclusion: "failure",
+				output: { title: "2 failing", summary: "..." },
+				details_url: "https://gh.example/runs/3",
+			},
+		};
+		const req = makeCheckRunRequest(payload);
+		await worker.fetch(req, env as any);
+
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"failure",
+			"build",
+			12345,
+			defaultConfig,
+			{ kind: "check", detail: "2 failing", url: "https://gh.example/runs/3" },
 		);
 	});
 
@@ -292,27 +398,7 @@ describe("worker fetch handler", () => {
 			"build",
 			12345,
 			defaultConfig,
-		);
-	});
-
-	it("maps check_run queued to pending", async () => {
-		const payload = {
-			...checkRunPayload,
-			check_run: { ...checkRunPayload.check_run, status: "queued", conclusion: null },
-		};
-		const req = makeCheckRunRequest(payload);
-		const res = await worker.fetch(req, env as any);
-
-		expect(res.status).toBe(200);
-		expect(mockedCompute).toHaveBeenCalledWith(
-			"test-installation-token",
-			"myorg",
-			"myrepo",
-			"abc123def",
-			"pending",
-			"build",
-			12345,
-			defaultConfig,
+			expect.objectContaining({ kind: "check" }),
 		);
 	});
 
@@ -334,27 +420,7 @@ describe("worker fetch handler", () => {
 			"build",
 			12345,
 			defaultConfig,
-		);
-	});
-
-	it("maps check_run timed_out conclusion to failure", async () => {
-		const payload = {
-			...checkRunPayload,
-			check_run: { ...checkRunPayload.check_run, status: "completed", conclusion: "timed_out" },
-		};
-		const req = makeCheckRunRequest(payload);
-		const res = await worker.fetch(req, env as any);
-
-		expect(res.status).toBe(200);
-		expect(mockedCompute).toHaveBeenCalledWith(
-			"test-installation-token",
-			"myorg",
-			"myrepo",
-			"abc123def",
-			"failure",
-			"build",
-			12345,
-			defaultConfig,
+			expect.objectContaining({ kind: "check" }),
 		);
 	});
 
@@ -376,27 +442,7 @@ describe("worker fetch handler", () => {
 			"build",
 			12345,
 			defaultConfig,
-		);
-	});
-
-	it("maps check_run skipped conclusion to success", async () => {
-		const payload = {
-			...checkRunPayload,
-			check_run: { ...checkRunPayload.check_run, status: "completed", conclusion: "skipped" },
-		};
-		const req = makeCheckRunRequest(payload);
-		const res = await worker.fetch(req, env as any);
-
-		expect(res.status).toBe(200);
-		expect(mockedCompute).toHaveBeenCalledWith(
-			"test-installation-token",
-			"myorg",
-			"myrepo",
-			"abc123def",
-			"success",
-			"build",
-			12345,
-			defaultConfig,
+			expect.objectContaining({ kind: "check" }),
 		);
 	});
 
@@ -418,13 +464,14 @@ describe("worker fetch handler", () => {
 			"build",
 			12345,
 			defaultConfig,
+			expect.objectContaining({ kind: "check" }),
 		);
 	});
 
-	it("processes check run named all-builds (not ignored)", async () => {
+	it("processes check run named all-builds from another app (not ignored)", async () => {
 		const payload = {
 			...checkRunPayload,
-			check_run: { ...checkRunPayload.check_run, name: "all-builds" },
+			check_run: { ...checkRunPayload.check_run, name: "all-builds", app: { id: 67890 } },
 		};
 		const req = makeCheckRunRequest(payload);
 		const res = await worker.fetch(req, env as any);
@@ -439,6 +486,7 @@ describe("worker fetch handler", () => {
 			"all-builds",
 			12345,
 			defaultConfig,
+			expect.objectContaining({ kind: "check" }),
 		);
 	});
 
@@ -453,8 +501,8 @@ describe("worker fetch handler", () => {
 
 	// workflow_run event tests
 
-	it("maps workflow_run startup_failure to failure", async () => {
-		mockedCompute.mockResolvedValue({ state: "failure", description: "One or more builds failed" });
+	it("maps workflow_run startup_failure to failure and publishes a failing check run", async () => {
+		mockedCompute.mockResolvedValue({ state: "failure", title: "CI failed: startup_failure", summary: "..." });
 		const req = makeWorkflowRunRequest(workflowRunPayload);
 		const res = await worker.fetch(req, env as any);
 
@@ -468,15 +516,17 @@ describe("worker fetch handler", () => {
 			"CI",
 			12345,
 			defaultConfig,
+			expect.objectContaining({ kind: "workflow", detail: "startup_failure" }),
 		);
-		expect(mockedCreateStatus).toHaveBeenCalledWith(
+		expect(mockedCreateCheckRun).toHaveBeenCalledWith(
 			"test-installation-token",
 			"myorg",
 			"myrepo",
 			"abc123def",
-			"failure",
 			"all-builds",
-			"One or more builds failed",
+			"completed",
+			"failure",
+			{ title: "CI failed: startup_failure", summary: "..." },
 		);
 	});
 
@@ -498,28 +548,7 @@ describe("worker fetch handler", () => {
 			"CI",
 			12345,
 			defaultConfig,
-		);
-	});
-
-	it("maps in-progress workflow_run to pending", async () => {
-		const payload = {
-			...workflowRunPayload,
-			action: "in_progress",
-			workflow_run: { ...workflowRunPayload.workflow_run, status: "in_progress", conclusion: null },
-		};
-		const req = makeWorkflowRunRequest(payload);
-		const res = await worker.fetch(req, env as any);
-
-		expect(res.status).toBe(200);
-		expect(mockedCompute).toHaveBeenCalledWith(
-			"test-installation-token",
-			"myorg",
-			"myrepo",
-			"abc123def",
-			"pending",
-			"CI",
-			12345,
-			defaultConfig,
+			expect.objectContaining({ kind: "workflow" }),
 		);
 	});
 
@@ -541,6 +570,7 @@ describe("worker fetch handler", () => {
 			"",
 			12345,
 			defaultConfig,
+			expect.objectContaining({ kind: "workflow" }),
 		);
 	});
 

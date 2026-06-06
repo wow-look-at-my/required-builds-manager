@@ -2,6 +2,8 @@ export interface CommitStatus {
 	state: string;
 	context: string;
 	id: number;
+	description?: string | null;
+	target_url?: string | null;
 }
 
 export interface CheckRun {
@@ -9,6 +11,9 @@ export interface CheckRun {
 	status: string;
 	conclusion: string | null;
 	app?: { id: number };
+	output?: { title: string | null; summary: string | null };
+	details_url?: string | null;
+	html_url?: string | null;
 }
 
 export interface WorkflowRun {
@@ -16,6 +21,13 @@ export interface WorkflowRun {
 	status: string;
 	conclusion: string | null;
 	head_sha: string;
+	html_url?: string | null;
+}
+
+export interface CheckRunOutput {
+	title: string;
+	summary: string;
+	text?: string;
 }
 
 import { fetchWithRetry } from "./fetch-retry";
@@ -124,16 +136,32 @@ export async function listWorkflowRuns(
 	return all;
 }
 
-export async function createStatus(
+// Publishes the combined result as a check run (rather than a commit status) so the
+// `output.summary` Markdown field can carry a full per-build breakdown — the commit-status
+// `description` is capped at ~140 chars. Creating check runs requires the GitHub App to hold
+// the `checks: write` permission.
+export async function createCheckRun(
 	token: string,
 	owner: string,
 	repo: string,
 	sha: string,
-	state: string,
-	context: string,
-	description: string,
+	name: string,
+	status: "in_progress" | "completed",
+	conclusion: string | null,
+	output: CheckRunOutput,
 ): Promise<void> {
-	const url = `${GITHUB_API}/repos/${owner}/${repo}/statuses/${sha}`;
+	const body: Record<string, unknown> = {
+		name,
+		head_sha: sha,
+		status,
+		output,
+	};
+	// `conclusion` is required when (and only when) the run is completed.
+	if (status === "completed") {
+		body.conclusion = conclusion ?? "failure";
+	}
+
+	const url = `${GITHUB_API}/repos/${owner}/${repo}/check-runs`;
 	const res = await fetchWithRetry(url, {
 		method: "POST",
 		headers: {
@@ -142,10 +170,10 @@ export async function createStatus(
 			"User-Agent": "required-builds-manager",
 			"Content-Type": "application/json",
 		},
-		body: JSON.stringify({ state, context, description }),
+		body: JSON.stringify(body),
 	});
 
 	if (!res.ok) {
-		throw new Error(`GitHub API error creating status: ${res.status} ${res.statusText}`);
+		throw new Error(`GitHub API error creating check run: ${res.status} ${res.statusText}`);
 	}
 }
