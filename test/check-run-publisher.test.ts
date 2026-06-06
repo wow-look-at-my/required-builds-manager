@@ -28,7 +28,7 @@ describe("publishViaCoordinator (Durable Object)", () => {
 			.intercept({ path: "/repos/o/r/check-runs", method: "POST" })
 			.reply(201, { id: 1 });
 
-		await publishViaCoordinator(ns(), "token", "o", "r", "do-sha-1", "all-builds", "completed", "success", output, 99999, 12345, []);
+		await publishViaCoordinator(ns(), "token", "o", "r", "do-sha-1", "all-builds", { status: "completed", conclusion: "success", output }, 99999, 12345, []);
 	});
 
 	it("updates the existing check run in place through the DO", async () => {
@@ -41,7 +41,7 @@ describe("publishViaCoordinator (Durable Object)", () => {
 			.intercept({ path: "/repos/o/r/check-runs/42", method: "PATCH" })
 			.reply(200, { id: 42 });
 
-		await publishViaCoordinator(ns(), "token", "o", "r", "do-sha-2", "all-builds", "completed", "failure", output, 99999, 12345, []);
+		await publishViaCoordinator(ns(), "token", "o", "r", "do-sha-2", "all-builds", { status: "completed", conclusion: "failure", output }, 99999, 12345, []);
 	});
 
 	it("serializes concurrent publishes for one commit into a single create + update", async () => {
@@ -69,8 +69,8 @@ describe("publishViaCoordinator (Durable Object)", () => {
 
 		const namespace = ns();
 		await Promise.all([
-			publishViaCoordinator(namespace, "token", "o", "r", "do-sha-3", "all-builds", "in_progress", null, output, 99999, 12345, []),
-			publishViaCoordinator(namespace, "token", "o", "r", "do-sha-3", "all-builds", "completed", "success", output, 99999, 12345, []),
+			publishViaCoordinator(namespace, "token", "o", "r", "do-sha-3", "all-builds", { status: "in_progress", conclusion: null, output }, 99999, 12345, []),
+			publishViaCoordinator(namespace, "token", "o", "r", "do-sha-3", "all-builds", { status: "completed", conclusion: "success", output }, 99999, 12345, []),
 		]);
 	});
 
@@ -88,7 +88,7 @@ describe("publishViaCoordinator (Durable Object)", () => {
 			.reply(201, { id: 1 });
 
 		const namespace = ns();
-		await publishViaCoordinator(namespace, "token", "o", "r", "arm-sha", "all-builds", "in_progress", null, output, 99999, 12345, []);
+		await publishViaCoordinator(namespace, "token", "o", "r", "arm-sha", "all-builds", { status: "in_progress", conclusion: null, output }, 99999, 12345, []);
 
 		const stub = namespace.get(namespace.idFromName("o/r@arm-sha"));
 		const alarm = await runInDurableObject(stub, (_i, state) => state.storage.getAlarm());
@@ -117,8 +117,8 @@ describe("publishViaCoordinator (Durable Object)", () => {
 			.reply(200, { id: 9 });
 
 		const namespace = ns();
-		await publishViaCoordinator(namespace, "token", "o", "r", "clear-sha", "all-builds", "in_progress", null, output, 99999, 12345, []);
-		await publishViaCoordinator(namespace, "token", "o", "r", "clear-sha", "all-builds", "completed", "success", output, 99999, 12345, []);
+		await publishViaCoordinator(namespace, "token", "o", "r", "clear-sha", "all-builds", { status: "in_progress", conclusion: null, output }, 99999, 12345, []);
+		await publishViaCoordinator(namespace, "token", "o", "r", "clear-sha", "all-builds", { status: "completed", conclusion: "success", output }, 99999, 12345, []);
 
 		const stub = namespace.get(namespace.idFromName("o/r@clear-sha"));
 		const alarm = await runInDurableObject(stub, (_i, state) => state.storage.getAlarm());
@@ -166,7 +166,7 @@ describe("publishViaCoordinator (Durable Object)", () => {
 			.reply(200, { id: 5 });
 
 		const namespace = ns();
-		await publishViaCoordinator(namespace, "token", "o", "r", "heal-sha", "all-builds", "in_progress", null, output, 99999, 12345, []);
+		await publishViaCoordinator(namespace, "token", "o", "r", "heal-sha", "all-builds", { status: "in_progress", conclusion: null, output }, 99999, 12345, []);
 
 		const stub = namespace.get(namespace.idFromName("o/r@heal-sha"));
 		const ran = await runDurableObjectAlarm(stub);

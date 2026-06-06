@@ -14,6 +14,8 @@ export interface CheckRun {
 	output?: { title: string | null; summary: string | null };
 	details_url?: string | null;
 	html_url?: string | null;
+	started_at?: string | null;
+	completed_at?: string | null;
 }
 
 export interface WorkflowRun {
@@ -22,6 +24,8 @@ export interface WorkflowRun {
 	conclusion: string | null;
 	head_sha: string;
 	html_url?: string | null;
+	run_started_at?: string | null;
+	updated_at?: string | null;
 }
 
 export interface JobStep {
@@ -41,6 +45,14 @@ export interface CheckRunOutput {
 	title: string;
 	summary: string;
 	text?: string;
+}
+
+export interface CheckRunUpdate {
+	status: "in_progress" | "completed";
+	conclusion: string | null;
+	output: CheckRunOutput;
+	// ISO timestamp of the earliest build start, so GitHub's "in Xs" reflects total CI wall-clock.
+	startedAt?: string;
 }
 
 import { fetchWithRetry } from "./fetch-retry";
@@ -218,17 +230,20 @@ export async function publishCheckRun(
 	repo: string,
 	sha: string,
 	name: string,
-	status: "in_progress" | "completed",
-	conclusion: string | null,
-	output: CheckRunOutput,
+	update: CheckRunUpdate,
 	appId?: number,
 ): Promise<void> {
 	const existingId = await findOwnCheckRunId(token, owner, repo, sha, name, appId);
 
-	const body: Record<string, unknown> = { name, status, output };
+	const body: Record<string, unknown> = { name, status: update.status, output: update.output };
 	// `conclusion` is required when (and only when) the run is completed.
-	if (status === "completed") {
-		body.conclusion = conclusion ?? "failure";
+	if (update.status === "completed") {
+		body.conclusion = update.conclusion ?? "failure";
+	}
+	// Setting started_at to the first build's start makes GitHub render the run's duration ("in Xs")
+	// as the total CI wall-clock; completed_at defaults to now when we mark the run completed.
+	if (update.startedAt) {
+		body.started_at = update.startedAt;
 	}
 
 	let url: string;

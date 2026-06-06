@@ -235,7 +235,12 @@ export default {
 		);
 
 		const { status, conclusion } = toCheckRunResult(result.state);
-		const output = { title: result.title, summary: result.summary };
+		const update = {
+			status,
+			conclusion,
+			output: { title: result.title, summary: result.summary },
+			startedAt: result.startedAt,
+		};
 
 		// Route through the per-commit Durable Object so simultaneous build events serialize and
 		// produce a single "all-builds" check run rather than duplicates. installationId + the ignore
@@ -249,9 +254,7 @@ export default {
 				repo,
 				sha,
 				config.context,
-				status,
-				conclusion,
-				output,
+				update,
 				appId,
 				installationId,
 				config.ignore,

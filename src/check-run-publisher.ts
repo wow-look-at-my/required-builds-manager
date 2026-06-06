@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { publishCheckRun, type CheckRunOutput } from "./github";
+import { publishCheckRun, type CheckRunUpdate } from "./github";
 import { computeAllBuildsState, toCheckRunResult } from "./aggregate";
 import { getInstallationToken } from "./auth";
 
@@ -57,23 +57,21 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 		repo: string,
 		sha: string,
 		name: string,
-		status: "in_progress" | "completed",
-		conclusion: string | null,
-		output: CheckRunOutput,
+		update: CheckRunUpdate,
 		appId: number | undefined,
 		installationId: number,
 		ignore: string[],
 	): Promise<void> {
 		await this.ctx.blockConcurrencyWhile(async () => {
-			if (status === "in_progress") {
+			if (update.status === "in_progress") {
 				// Arm the safety net BEFORE publishing, so even a failed/dropped pending publish still
 				// gets re-checked by the alarm.
 				await this.armReconcile({ owner, repo, sha, installationId, appId: appId ?? 0, context: name, ignore });
-				await publishCheckRun(token, owner, repo, sha, name, status, conclusion, output, appId);
+				await publishCheckRun(token, owner, repo, sha, name, update, appId);
 			} else {
 				// Terminal: publish first, and only stop reconciling once the terminal state actually
 				// lands. If this publish throws, any armed alarm stays set and will retry.
-				await publishCheckRun(token, owner, repo, sha, name, status, conclusion, output, appId);
+				await publishCheckRun(token, owner, repo, sha, name, update, appId);
 				await this.clearReconcile();
 			}
 		});
@@ -108,9 +106,7 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 					s.repo,
 					s.sha,
 					s.context,
-					status,
-					conclusion,
-					{ title: result.title, summary: result.summary },
+					{ status, conclusion, output: { title: result.title, summary: result.summary }, startedAt: result.startedAt },
 					s.appId || undefined,
 				);
 				return status === "completed" ? "resolved" : "pending";
@@ -174,14 +170,12 @@ export async function publishViaCoordinator(
 	repo: string,
 	sha: string,
 	name: string,
-	status: "in_progress" | "completed",
-	conclusion: string | null,
-	output: CheckRunOutput,
+	update: CheckRunUpdate,
 	appId: number | undefined,
 	installationId: number,
 	ignore: string[],
 ): Promise<void> {
 	const id = namespace.idFromName(`${owner}/${repo}@${sha}`);
 	const stub = namespace.get(id);
-	await stub.publish(token, owner, repo, sha, name, status, conclusion, output, appId, installationId, ignore);
+	await stub.publish(token, owner, repo, sha, name, update, appId, installationId, ignore);
 }
