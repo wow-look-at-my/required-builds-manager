@@ -91,15 +91,18 @@ describe("computeAllBuildsState", () => {
 		expect(result.summary).toContain("([details](https://ci.example/run/1))");
 	});
 
-	it("pending incoming, no failures in existing — incoming pulls state to pending", async () => {
+	it("pending incoming does NOT drag a build the listing shows as passed back to pending", async () => {
+		// The authoritative listing says ci passed. A pending incoming event (e.g. a stale or
+		// out-of-order webhook redelivery) must not pull all-builds back to "in progress" — that is
+		// exactly how check runs were getting wedged on "in progress" while every build was green.
 		mockedListStatuses.mockResolvedValue([
 			{ state: "success", context: "ci", id: 1 },
 		]);
 
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "ci");
 
-		expect(result.state).toBe("pending");
-		expect(result.title).toBe("ci in progress");
+		expect(result.state).toBe("success");
+		expect(result.title).toBe("All builds passed");
 	});
 
 	it("pending incoming, with failure in existing", async () => {
@@ -131,11 +134,14 @@ describe("computeAllBuildsState", () => {
 		expect(result.title).toBe("All builds passed");
 	});
 
-	it("no other statuses or check runs — pending incoming", async () => {
+	it("no other statuses or check runs — pending incoming reflects the (empty) listing, not the event", async () => {
+		// A bare pending event invents nothing: the listing is authoritative, and a real pending
+		// build would already appear in it (it exists the moment its webhook fires). Trusting the
+		// event here is what left all-builds stuck "in progress" after the build had finished.
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "ci");
 
-		expect(result.state).toBe("pending");
-		expect(result.title).toBe("ci in progress");
+		expect(result.state).toBe("success");
+		expect(result.title).toBe("All builds passed");
 	});
 
 	it("filters out all-builds status context", async () => {
@@ -627,6 +633,70 @@ describe("computeAllBuildsState", () => {
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "lint");
 
 			expect(result.state).toBe("failure");
+		});
+	});
+
+	// Regression: an all-builds check run must never get wedged on "in progress" while every real
+	// build is green. This happened because a non-failure incoming event was folded into the
+	// aggregate — a pending workflow_run pushed a phantom row (passing/running workflows have no
+	// standalone row, only failing ones do), or a stale/out-of-order pending status/check_run
+	// dragged a passed row back down — and nothing re-aggregated to clear it.
+	describe("incoming non-failure events never wedge all-builds on in-progress", () => {
+		it("a pending workflow_run event does not add a phantom 'in progress' row (PR #179 repro)", async () => {
+			// Every real build for the commit has passed...
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "success" },
+				{ name: "deploy / preview", status: "completed", conclusion: "success" },
+			]);
+			mockedListWorkflowRuns.mockResolvedValue([
+				{ name: "Pages", status: "completed", conclusion: "success", head_sha: "abc123" },
+			]);
+
+			// ...but a late/out-of-order "Pages" workflow_run in_progress event is the last thing we
+			// process. It must NOT invent a pending workflow row, so all-builds stays green.
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "pending", "Pages", undefined, undefined,
+				{ kind: "workflow" },
+			);
+
+			expect(result.state).toBe("success");
+			expect(result.title).toBe("All builds passed");
+		});
+
+		it("a stale pending check_run event does not pull a passed build back to pending", async () => {
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "success" },
+			]);
+
+			// A redelivered "build" in_progress event arrives after build already passed.
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "pending", "build", undefined, undefined,
+				{ kind: "check" },
+			);
+
+			expect(result.state).toBe("success");
+		});
+
+		it("a pending workflow_run event with an empty listing invents nothing", async () => {
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "pending", "Pages", undefined, undefined,
+				{ kind: "workflow" },
+			);
+
+			expect(result.state).toBe("success");
+		});
+
+		it("STILL folds in an incoming failure the listing has not yet indexed (lag)", async () => {
+			// The failure path is the whole reason fold-in exists — it must keep working. Here a
+			// workflow startup_failure event arrives before listWorkflowRuns reports it.
+			const result = await computeAllBuildsState(
+				"token", "owner", "repo", "abc123", "failure", "CI", undefined, undefined,
+				{ kind: "workflow", detail: "startup_failure", url: "https://gh.example/run/9" },
+			);
+
+			expect(result.state).toBe("failure");
+			expect(result.title).toBe("CI failed: startup_failure");
+			expect(result.summary).toContain("(workflow)");
 		});
 	});
 });

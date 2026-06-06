@@ -260,12 +260,25 @@ export async function computeAllBuildsState(
 		}
 	}
 
-	// Fold in the triggering build. The deduped listing above is authoritative for the latest
-	// reported state, but it can lag the event that just fired — so reflect the incoming build too,
-	// only ever pulling a row's state down (see rank()). Skip it if ignored or if it is our own
-	// combined context.
-	if (!incomingIsIgnored && incomingContext !== contextName) {
-		const incomingSimple = toSimple(incomingState);
+	// Fold in the triggering build — but ONLY when it reports a failure. The deduped listing above
+	// is authoritative for the current state of every status and check run, so an incoming success
+	// or pending event adds nothing it doesn't already show. Worse, trusting a non-failure incoming
+	// can wedge all-builds on "in progress" while every real build is green:
+	//
+	//   * Workflow runs have no standalone row unless they FAIL — a passing or in-progress workflow
+	//     is represented by its own check runs (see the workflow loop above, which only adds
+	//     failures). So folding in a pending `workflow_run` event pushes a phantom "in progress"
+	//     entry that no later listing ever clears.
+	//   * GitHub delivers webhooks out of order and at-least-once, so a stale or redelivered
+	//     "pending" event can arrive AFTER a build has completed and drag its row back to pending
+	//     via the low-water-mark — and because that pending event is the last one processed,
+	//     nothing re-aggregates to undo it.
+	//
+	// Folding in only failures preserves the one job this has — surfacing a failure (notably a
+	// workflow `startup_failure`) the list endpoints haven't indexed yet — without ever letting an
+	// event raise or invent state the authoritative listing disagrees with.
+	const incomingSimple = toSimple(incomingState);
+	if (incomingSimple === "failure" && !incomingIsIgnored && incomingContext !== contextName) {
 		const existing = entries.find(
 			(e) => e.name === incomingContext && (incoming?.kind === undefined || e.kind === incoming.kind),
 		);
