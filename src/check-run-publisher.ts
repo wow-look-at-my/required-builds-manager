@@ -2,13 +2,30 @@ import { DurableObject } from "cloudflare:workers";
 import { publishStatus, type StatusUpdate } from "./github";
 import { computeAllBuildsState } from "./aggregate";
 import { getInstallationToken } from "./auth";
+import { applyIncoming, compare, type IncomingBuild, type PredBuild, type SimpleState } from "./predict";
+import { recordMeasurement, type StatsRecorder } from "./stats";
 
-// Bindings the DO needs to mint a fresh token and re-aggregate during a reconciliation alarm.
+// Bindings the DO needs to mint a fresh token and re-aggregate during a reconciliation alarm, plus the
+// global stats DO that records the event-only-vs-list comparison.
 interface PublisherEnv {
 	GITHUB_APP_ID: string;
 	GITHUB_APP_PRIVATE_KEY: string;
 	TOKEN_CACHE?: KVNamespace;
+	STATS_RECORDER?: DurableObjectNamespace<StatsRecorder>;
 }
+
+// Everything the per-commit comparison needs: the triggering build reduced to a single state (null when
+// the event isn't measurable, e.g. an ignored context), the authoritative per-build listing the worker
+// is about to publish, that listing's combined state, and the repo's visibility (for the dashboard).
+export interface MeasurePayload {
+	incoming: IncomingBuild | null;
+	actualBuilds: PredBuild[];
+	actualState: SimpleState | "error";
+	isPrivate: boolean;
+}
+
+// DO storage key for the event-only build-state store, kept corrected to the latest list per commit.
+const EVENTSTORE_KEY = "eventstore";
 
 // Everything the reconciliation alarm needs to re-aggregate a commit from scratch (with no triggering
 // event) and re-publish its status. Persisted in DO storage only while the result is non-terminal.
@@ -69,8 +86,18 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 		appId: number | undefined,
 		installationId: number,
 		ignore: string[],
+		measure?: MeasurePayload,
 	): Promise<void> {
 		await this.ctx.blockConcurrencyWhile(async () => {
+			if (measure) {
+				// Record the event-only-vs-list comparison and re-correct the store. Best-effort: a
+				// measurement failure must never block (or break) the actual publish.
+				try {
+					await this.measure(owner, repo, sha, update.targetUrl, measure);
+				} catch {
+					// swallow -- telemetry only
+				}
+			}
 			if (update.state === "pending") {
 				// Arm the safety net BEFORE publishing, so even a failed/dropped pending publish still
 				// gets re-checked by the alarm.
@@ -161,6 +188,44 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 		});
 	}
 
+	// Compares the event-only prediction against the authoritative list, records the outcome, then
+	// re-corrects the stored snapshot to reality. The store starts from the LAST list snapshot, so the
+	// prediction is "known-good snapshot + just this one event" -- the fairest test of events-alone.
+	// A disagreement is a receipt that the list call learned something this event didn't carry.
+	private async measure(
+		owner: string,
+		repo: string,
+		sha: string,
+		targetUrl: string,
+		m: MeasurePayload,
+	): Promise<void> {
+		if (m.actualState === "error") return; // aggregation failed -- nothing meaningful to compare
+		const prev = (await this.ctx.storage.get<PredBuild[]>(EVENTSTORE_KEY)) ?? [];
+		const predicted = m.incoming ? applyIncoming(prev, m.incoming) : prev;
+
+		// Only record when there's a real triggering build to attribute (an ignored/own event still
+		// re-corrects the store below, but isn't itself a "was this event enough?" data point).
+		if (m.incoming && this.env.STATS_RECORDER) {
+			const cmp = compare(predicted, m.actualBuilds, m.actualState);
+			await recordMeasurement(this.env.STATS_RECORDER, {
+				fullName: `${owner}/${repo}`,
+				isPrivate: m.isPrivate,
+				sha,
+				at: Date.now(),
+				agree: cmp.agree,
+				predicted: cmp.predicted,
+				actual: cmp.actual,
+				reason: cmp.reason,
+				direction: cmp.direction,
+				detail: cmp.detail,
+				targetUrl,
+			});
+		}
+
+		// Keep the store corrected to reality for the next event.
+		await this.ctx.storage.put<PredBuild[]>(EVENTSTORE_KEY, m.actualBuilds);
+	}
+
 	private async armReconcile(s: Omit<ReconcileState, "attempts">): Promise<void> {
 		// Reset attempts on every real event -- progress is happening, so restart the backoff clock.
 		await this.ctx.storage.put<ReconcileState>(RECONCILE_KEY, { ...s, attempts: 0 });
@@ -186,8 +251,9 @@ export async function publishViaCoordinator(
 	appId: number | undefined,
 	installationId: number,
 	ignore: string[],
+	measure?: MeasurePayload,
 ): Promise<void> {
 	const id = namespace.idFromName(`${owner}/${repo}@${sha}`);
 	const stub = namespace.get(id);
-	await stub.publish(token, owner, repo, sha, context, update, appId, installationId, ignore);
+	await stub.publish(token, owner, repo, sha, context, update, appId, installationId, ignore, measure);
 }

@@ -30,6 +30,8 @@ vi.mock("../src/auth", () => ({
 
 vi.mock("../src/config", () => ({
 	getRepoConfig: vi.fn(),
+	// index.ts calls this when building the measurement payload; default to "nothing ignored".
+	matchesIgnorePattern: vi.fn(() => false),
 }));
 
 vi.mock("../src/sign", () => ({
@@ -105,7 +107,7 @@ const statusPayload = {
 	state: "success",
 	context: "ci/tests",
 	sha: "abc123def",
-	repository: { full_name: "myorg/myrepo" },
+	repository: { full_name: "myorg/myrepo", private: false },
 	installation: { id: 12345 },
 };
 
@@ -117,7 +119,7 @@ const checkRunPayload = {
 		conclusion: "success",
 		head_sha: "abc123def",
 	},
-	repository: { full_name: "myorg/myrepo" },
+	repository: { full_name: "myorg/myrepo", private: false },
 	installation: { id: 12345 },
 };
 
@@ -129,7 +131,7 @@ const workflowRunPayload = {
 		conclusion: "startup_failure",
 		head_sha: "abc123def",
 	},
-	repository: { full_name: "myorg/myrepo" },
+	repository: { full_name: "myorg/myrepo", private: false },
 	installation: { id: 12345 },
 };
 
@@ -246,6 +248,7 @@ describe("worker fetch handler", () => {
 			12345,
 			12345,
 			[],
+			expect.objectContaining({ actualBuilds: expect.any(Array), actualState: expect.any(String) }),
 		);
 		// The webhook path publishes state + title only; it must NOT pay for per-step enrichment.
 		expect(mockedEnrich).not.toHaveBeenCalled();
@@ -290,6 +293,7 @@ describe("worker fetch handler", () => {
 			12345,
 			12345,
 			[],
+			expect.objectContaining({ actualBuilds: expect.any(Array), actualState: expect.any(String) }),
 		);
 	});
 
@@ -312,6 +316,7 @@ describe("worker fetch handler", () => {
 			12345,
 			12345,
 			[],
+			expect.objectContaining({ actualBuilds: expect.any(Array), actualState: expect.any(String) }),
 		);
 	});
 
@@ -582,6 +587,7 @@ describe("worker fetch handler", () => {
 			12345,
 			12345,
 			[],
+			expect.objectContaining({ actualBuilds: expect.any(Array), actualState: expect.any(String) }),
 		);
 	});
 

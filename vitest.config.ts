@@ -10,6 +10,7 @@ export default defineWorkersConfig({
 						GITHUB_APP_ID: "12345",
 						GITHUB_APP_PRIVATE_KEY: "test-private-key",
 						WEBHOOK_SECRET: "test-secret",
+						DASHBOARD_PASSWORD: "test-password",
 					},
 					kvNamespaces: ["TOKEN_CACHE"],
 				},

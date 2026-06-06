@@ -35,15 +35,19 @@ If you are tempted to do any of the above because "the pipeline looks broken": s
 
 ```
 src/
-├── index.ts       # Worker entry point — POST webhook handler (event routing, incoming-detail extraction, self-loop guards, routes publishing through the Durable Object with a 403 token-refresh retry) AND a GET /b/{owner}/{repo}/{sha} route serving the capability-URL-gated breakdown page (which calls enrichWithSteps before rendering); also re-exports the DO class
+├── index.ts       # Worker entry point — POST webhook handler (event routing, incoming-detail extraction, self-loop guards, routes publishing through the Durable Object with a 403 token-refresh retry), a GET /b/{owner}/{repo}/{sha} route serving the capability-URL-gated breakdown page (which calls enrichWithSteps before rendering), AND GET /dashboard (+ /dashboard/login|logout) serving the event-only-vs-list stats dashboard; also re-exports both DO classes
 ├── aggregate.ts   # Low-water-mark aggregation: fetches all statuses + check-runs + workflow-runs, deduplicates, computes combined state, and returns the structured per-build breakdown (state, title, grouped failed/pending/passed entries, earliest start). Also exports enrichWithSteps — a SEPARATE pass that fetches each failed/in-progress job's steps, called ONLY by the breakdown page (not the webhook path), so the hot path never makes a getWorkflowJob call per job for data it would discard
-├── check-run-publisher.ts # CheckRunPublisher Durable Object (name kept to avoid a DO migration; it now publishes commit statuses): serializes publishing per commit via blockConcurrencyWhile AND self-heals via an alarm that re-aggregates + re-publishes when a terminal event is missed + publishViaCoordinator helper (routes by owner/repo@sha)
+├── check-run-publisher.ts # CheckRunPublisher Durable Object (name kept to avoid a DO migration; it now publishes commit statuses): serializes publishing per commit via blockConcurrencyWhile AND self-heals via an alarm that re-aggregates + re-publishes when a terminal event is missed + publishViaCoordinator helper (routes by owner/repo@sha). On each publish it also runs the event-only-vs-list comparison (maintaining a per-commit store kept corrected to the list) and records the outcome to StatsRecorder -- best-effort, never blocks publishing
 ├── auth.ts        # GitHub App JWT generation (RS256), installation token caching (with forceRefresh), getInstallationId (resolves a repo's installation for the breakdown GET route), PKCS#1/PKCS#8 key handling
 ├── config.ts      # Per-repo YAML config loading from .github/required-builds.yml (with org .github repo fallback)
 ├── fetch-retry.ts # Retry wrapper with exponential backoff for transient HTTP errors
 ├── github.ts      # GitHub API client: listStatuses, listCheckRuns, listWorkflowRuns, getWorkflowJob (job steps), publishStatus (POST a commit status; attaches HTTP status to thrown errors) (paginated)
 ├── render.ts      # Renders the AggregateResult as the self-hosted breakdown HTML page (HTML-escaped, http(s)-only links, per-step icons, total time)
 ├── sign.ts        # HMAC-SHA256 capability-URL signing/verification (signResource/verifyResource) for the breakdown page's target_url
+├── predict.ts     # Event-only prediction model (pure): applyIncoming/aggregateState/compare -- the "would events alone have matched the list?" comparison behind the /dashboard receipts
+├── stats.ts       # StatsRecorder Durable Object (SQLite, one global instance): per-repo agree/disagree counters + a capped ring of disagreement "receipts"; getStatsSummary/recordMeasurement helpers (visibility-filtered)
+├── session.ts     # Dashboard admin session: HMAC-signed cookie (reuses sign.ts) + constant-time DASHBOARD_PASSWORD check; gates private repos
+├── dashboard.ts   # Renders the /dashboard HTML (agreement %, per-repo breakdown, recent receipts); ASCII-only, HTML-escaped
 └── verify.ts      # HMAC-SHA256 webhook signature verification
 test/
 ├── handler.test.ts             # Handler integration tests (webhook publish + breakdown GET route)
@@ -55,6 +59,10 @@ test/
 ├── auth.test.ts                # JWT, token caching, and installation-id tests
 ├── config.test.ts              # Config parsing, glob matching, and fetching tests
 ├── fetch-retry.test.ts         # Retry logic tests
+├── predict.test.ts             # Event-only prediction + comparison tests
+├── stats.test.ts               # StatsRecorder DO: counters, receipts, private filtering
+├── session.test.ts             # Admin cookie + password-check tests
+├── dashboard.test.ts           # Dashboard route tests (public vs admin, login/logout)
 └── verify.test.ts              # Signature verification tests
 ```
 
@@ -108,7 +116,8 @@ Set as Cloudflare Worker secrets (never commit these):
 |---|---|
 | `GITHUB_APP_ID` | GitHub App identifier |
 | `GITHUB_APP_PRIVATE_KEY` | PEM-encoded RSA private key (PKCS#1 or PKCS#8) |
-| `WEBHOOK_SECRET` | GitHub webhook HMAC secret — also the HMAC key for signing the breakdown page's capability URLs |
+| `WEBHOOK_SECRET` | GitHub webhook HMAC secret — also the HMAC key for signing the breakdown page's capability URLs AND the `/dashboard` admin session cookie |
+| `DASHBOARD_PASSWORD` | Optional. Shared password gating private repos on the `/dashboard` stats page. When unset, the dashboard is public-only (no login possible). |
 
 ### KV Bindings
 
@@ -120,7 +129,8 @@ Set as Cloudflare Worker secrets (never commit these):
 
 | Binding | Class | Description |
 |---|---|---|
-| `CHECK_RUN_PUBLISHER` | `CheckRunPublisher` | Serializes commit-status publishing per commit (keyed by `owner/repo@sha`) so concurrent events can't interleave into a stale status — AND self-heals via an `alarm`: when a pending result is published it schedules a re-check that re-aggregates and re-publishes, so a dropped/missed terminal event can't leave the status stuck on "pending". (Class name kept from the check-run era to avoid a DO migration.) Declared via a `new_sqlite_classes` migration in `wrangler.jsonc`. |
+| `CHECK_RUN_PUBLISHER` | `CheckRunPublisher` | Serializes commit-status publishing per commit (keyed by `owner/repo@sha`) so concurrent events can't interleave into a stale status — AND self-heals via an `alarm`: when a pending result is published it schedules a re-check that re-aggregates and re-publishes, so a dropped/missed terminal event can't leave the status stuck on "pending". (Class name kept from the check-run era to avoid a DO migration.) Declared via a `new_sqlite_classes` migration (`v1`) in `wrangler.jsonc`. |
+| `STATS_RECORDER` | `StatsRecorder` | One global instance (`idFromName("global")`) that records the event-only-vs-list comparison per repo (agree/disagree counters + a capped ring of disagreement receipts) for the `/dashboard` page. SQLite-backed, declared via the `v2` `new_sqlite_classes` migration. |
 
 ## Testing
 
