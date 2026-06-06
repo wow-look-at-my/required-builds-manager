@@ -14,6 +14,8 @@ export interface CheckRun {
 	output?: { title: string | null; summary: string | null };
 	details_url?: string | null;
 	html_url?: string | null;
+	started_at?: string | null;
+	completed_at?: string | null;
 }
 
 export interface WorkflowRun {
@@ -22,6 +24,8 @@ export interface WorkflowRun {
 	conclusion: string | null;
 	head_sha: string;
 	html_url?: string | null;
+	run_started_at?: string | null;
+	updated_at?: string | null;
 }
 
 export interface CheckRunOutput {
