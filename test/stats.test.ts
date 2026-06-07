@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
-import type { StatsRecorder, MeasurementInput } from "../src/stats";
+import { filterSummaryForViewer } from "../src/stats";
+import type { StatsRecorder, MeasurementInput, StatsSummary, RepoStat, Receipt } from "../src/stats";
 
 // Exercises the real StatsRecorder Durable Object (SQLite). Each test uses a distinct DO name so its
 // SQLite store is isolated from the others.
@@ -82,5 +83,65 @@ describe("StatsRecorder", () => {
 		const all = await s.summary(true);
 		expect(all.repos.map((r) => r.fullName).sort()).toEqual(["o/pub", "o/sec"]);
 		expect(all.total).toBe(2);
+	});
+});
+
+describe("filterSummaryForViewer", () => {
+	const repo = (fullName: string, isPrivate: boolean, total: number, agree: number): RepoStat => ({
+		fullName,
+		isPrivate,
+		total,
+		agree,
+		disagree: total - agree,
+		missingBuild: 0,
+		staleState: 0,
+		listLag: 0,
+		emptyVsFilled: 0,
+		falseGreen: 0,
+		falseBlock: 0,
+		lastAt: 0,
+	});
+	const receipt = (fullName: string, isPrivate: boolean): Receipt => ({
+		fullName,
+		isPrivate,
+		sha: "abc1234",
+		at: 0,
+		predicted: "success",
+		actual: "pending",
+		reason: "missing_build",
+		direction: "false_green",
+		detail: "",
+		targetUrl: "",
+	});
+	const full: StatsSummary = {
+		total: 10,
+		agree: 7,
+		disagree: 3,
+		repos: [repo("o/pub", false, 4, 3), repo("o/sec", true, 4, 3), repo("o/sec2", true, 2, 1)],
+		receipts: [receipt("o/pub", false), receipt("o/sec", true), receipt("o/sec2", true)],
+	};
+
+	it("keeps public repos and drops every private repo when the allow-list is empty", () => {
+		const out = filterSummaryForViewer(full, []);
+		expect(out.repos.map((r) => r.fullName)).toEqual(["o/pub"]);
+		expect(out.receipts.map((r) => r.fullName)).toEqual(["o/pub"]);
+		// Totals recomputed from survivors (only o/pub: 4 total, 3 agree).
+		expect(out.total).toBe(4);
+		expect(out.agree).toBe(3);
+		expect(out.disagree).toBe(1);
+	});
+
+	it("includes the private repos named in the allow-list", () => {
+		const out = filterSummaryForViewer(full, ["o/sec"]);
+		expect(out.repos.map((r) => r.fullName).sort()).toEqual(["o/pub", "o/sec"]);
+		expect(out.receipts.map((r) => r.fullName).sort()).toEqual(["o/pub", "o/sec"]);
+		expect(out.total).toBe(8); // 4 + 4
+		expect(out.agree).toBe(6); // 3 + 3
+	});
+
+	it("ignores allow-list entries that aren't tracked private repos", () => {
+		const out = filterSummaryForViewer(full, ["o/not-here"]);
+		expect(out.repos.map((r) => r.fullName)).toEqual(["o/pub"]);
+		expect(out.total).toBe(4);
 	});
 });

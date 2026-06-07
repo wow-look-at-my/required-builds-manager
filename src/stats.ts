@@ -221,3 +221,16 @@ export async function getStatsSummary(
 	const stub = ns.get(ns.idFromName("global"));
 	return stub.summary(includePrivate);
 }
+
+// Restricts a full summary (fetched with includePrivate=true) to what a specific signed-in viewer may
+// see: every public repo, plus the private repos whose full_name is in `allowedPrivate`. Repo and
+// receipt rows are filtered and the headline totals are recomputed from the survivors. Pure.
+export function filterSummaryForViewer(summary: StatsSummary, allowedPrivate: string[]): StatsSummary {
+	const allow = new Set(allowedPrivate);
+	const visible = (isPrivate: boolean, fullName: string) => !isPrivate || allow.has(fullName);
+	const repos = summary.repos.filter((r) => visible(r.isPrivate, r.fullName));
+	const receipts = summary.receipts.filter((r) => visible(r.isPrivate, r.fullName));
+	const total = repos.reduce((s, r) => s + r.total, 0);
+	const agree = repos.reduce((s, r) => s + r.agree, 0);
+	return { total, agree, disagree: total - agree, repos, receipts };
+}

@@ -6,9 +6,22 @@ import { getRepoConfig, matchesIgnorePattern } from "./config";
 import { signResource, verifyResource } from "./sign";
 import { renderBreakdownHtml } from "./render";
 import { toSimpleState, type BuildKind } from "./predict";
-import { getStatsSummary, type StatsRecorder, type StatsSummary } from "./stats";
+import { getStatsSummary, filterSummaryForViewer, type StatsRecorder, type StatsSummary } from "./stats";
 import { renderDashboardHtml } from "./dashboard";
-import { isAdmin, issueAdminCookie, clearAdminCookie, passwordMatches } from "./session";
+import {
+	oauthConfigured,
+	authorizeUrl,
+	randomState,
+	issueStateCookie,
+	clearStateCookie,
+	verifyState,
+	exchangeCode,
+	fetchLogin,
+	canAccessRepo,
+	issueSessionCookie,
+	clearSessionCookie,
+	readSession,
+} from "./session";
 
 // The Durable Object classes must be exported from the Worker's entry module so the runtime can
 // instantiate them (see the durable_objects bindings in wrangler.jsonc).
@@ -19,9 +32,10 @@ interface Env {
 	GITHUB_APP_ID: string;
 	GITHUB_APP_PRIVATE_KEY: string;
 	WEBHOOK_SECRET: string;
-	// Optional shared password gating private repos on the stats dashboard. Unset -> dashboard is
-	// public-only (no login possible).
-	DASHBOARD_PASSWORD?: string;
+	// GitHub App OAuth client credentials for "Sign in with GitHub" on the stats dashboard. When unset,
+	// the dashboard is public-only (no sign-in possible).
+	GITHUB_CLIENT_ID?: string;
+	GITHUB_CLIENT_SECRET?: string;
 	TOKEN_CACHE?: KVNamespace;
 	CHECK_RUN_PUBLISHER: DurableObjectNamespace<CheckRunPublisher>;
 	STATS_RECORDER: DurableObjectNamespace<StatsRecorder>;
@@ -408,35 +422,71 @@ async function serveBreakdown(request: Request, env: Env, url: URL): Promise<Res
 	});
 }
 
-// Dashboard routes: GET /dashboard (render), POST /dashboard/login (set admin cookie), GET
-// /dashboard/logout (clear it). "Logged in" is a single shared-password gate (see session.ts); it only
-// unlocks private repos -- public-repo stats are visible to everyone.
+// Dashboard routes: GET /dashboard (render), GET /dashboard/login (-> GitHub authorize), GET
+// /dashboard/callback (OAuth code exchange -> session cookie), GET /dashboard/logout (clear it).
+// "Signed in" is a per-user GitHub OAuth session (see session.ts): public repos show to everyone, and a
+// signed-in user additionally sees the private repos their own GitHub account can access.
 async function serveDashboardRoutes(request: Request, env: Env, url: URL): Promise<Response> {
 	const path = url.pathname;
 
-	if (path === "/dashboard/login" && request.method === "POST") {
-		const form = await request.formData();
-		const password = String(form.get("password") ?? "");
-		if (!(await passwordMatches(env.WEBHOOK_SECRET, env.DASHBOARD_PASSWORD, password))) {
-			return redirect("/dashboard?e=1");
+	// Begin sign-in: redirect to GitHub's authorize page, carrying a signed CSRF state cookie.
+	if (path === "/dashboard/login" && request.method === "GET") {
+		if (!oauthConfigured(env)) return redirect("/dashboard");
+		const state = randomState();
+		return redirect(authorizeUrl(env, url.origin, state), [
+			await issueStateCookie(env.WEBHOOK_SECRET, state, Date.now()),
+		]);
+	}
+
+	// OAuth callback: verify the state, exchange the code for a (single-use) user token, compute which of
+	// our tracked private repos that token can read, and store that allow-list in a signed session cookie.
+	if (path === "/dashboard/callback" && request.method === "GET") {
+		const code = url.searchParams.get("code") ?? "";
+		const state = url.searchParams.get("state") ?? "";
+		const cookie = request.headers.get("Cookie");
+		if (!oauthConfigured(env) || !code || !(await verifyState(env.WEBHOOK_SECRET, cookie, state, Date.now()))) {
+			return redirect("/dashboard?e=1", [clearStateCookie()]);
 		}
-		return redirect("/dashboard", await issueAdminCookie(env.WEBHOOK_SECRET, Date.now()));
+		const token = await exchangeCode(env, code, url.origin);
+		if (!token) return redirect("/dashboard?e=1", [clearStateCookie()]);
+		const login = (await fetchLogin(token)) ?? "";
+
+		// Of the private repos we track, keep only the ones this user's token can actually read.
+		let allowed: string[] = [];
+		try {
+			const all = await getStatsSummary(env.STATS_RECORDER, true);
+			const privateRepos = all.repos.filter((r) => r.isPrivate).map((r) => r.fullName);
+			const checks = await Promise.all(
+				privateRepos.map(async (fn) => ((await canAccessRepo(token, fn)) ? fn : null)),
+			);
+			allowed = checks.filter((x): x is string => x !== null);
+		} catch {
+			allowed = [];
+		}
+
+		const session = await issueSessionCookie(env.WEBHOOK_SECRET, { login, repos: allowed }, Date.now());
+		return redirect("/dashboard", [session, clearStateCookie()]);
 	}
 
 	if (path === "/dashboard/logout") {
-		return redirect("/dashboard", clearAdminCookie());
+		return redirect("/dashboard", [clearSessionCookie()]);
 	}
 
 	if (path === "/dashboard" && request.method === "GET") {
-		const admin = await isAdmin(env.WEBHOOK_SECRET, request.headers.get("Cookie"), Date.now());
+		const session = await readSession(env.WEBHOOK_SECRET, request.headers.get("Cookie"), Date.now());
 		let summary: StatsSummary;
 		try {
-			summary = await getStatsSummary(env.STATS_RECORDER, admin);
+			const full = await getStatsSummary(env.STATS_RECORDER, !!session);
+			summary = session ? filterSummaryForViewer(full, session.repos) : full;
 		} catch {
 			// A stats-store failure must not take down the dashboard -- show an empty board.
 			summary = { total: 0, agree: 0, disagree: 0, repos: [], receipts: [] };
 		}
-		const html = renderDashboardHtml(summary, { admin, loginError: url.searchParams.get("e") === "1" });
+		const html = renderDashboardHtml(summary, {
+			user: session?.login,
+			configured: oauthConfigured(env),
+			error: url.searchParams.get("e") === "1",
+		});
 		return new Response(html, {
 			status: 200,
 			headers: {
@@ -450,9 +500,9 @@ async function serveDashboardRoutes(request: Request, env: Env, url: URL): Promi
 	return new Response("Method not allowed", { status: 405 });
 }
 
-// 303 See Other redirect, optionally setting a cookie.
-function redirect(location: string, setCookie?: string): Response {
-	const headers: Record<string, string> = { Location: location };
-	if (setCookie) headers["Set-Cookie"] = setCookie;
+// 303 See Other redirect, optionally setting one or more cookies.
+function redirect(location: string, setCookies?: string[]): Response {
+	const headers = new Headers({ Location: location });
+	for (const c of setCookies ?? []) headers.append("Set-Cookie", c);
 	return new Response(null, { status: 303, headers });
 }

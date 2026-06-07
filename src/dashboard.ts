@@ -67,7 +67,7 @@ function receiptRow(rc: Receipt): string {
 
 export function renderDashboardHtml(
 	summary: StatsSummary,
-	opts: { admin: boolean; loginError?: boolean },
+	opts: { user?: string; configured: boolean; error?: boolean },
 ): string {
 	const { total, agree, disagree } = summary;
 
@@ -93,14 +93,15 @@ export function renderDashboardHtml(
 			? ""
 			: `<h2>Receipts (recent misses)</h2><ul class="receipts">${summary.receipts.map(receiptRow).join("")}</ul>`;
 
-	const authBox = opts.admin
-		? `<div class="auth">Logged in as admin (private repos shown). <a href="/dashboard/logout">Log out</a></div>`
-		: `<form class="auth" method="POST" action="/dashboard/login">` +
-			(opts.loginError ? `<span class="danger">Incorrect password.</span> ` : "") +
+	const authBox = opts.user
+		? `<div class="auth">Signed in as <strong>${esc(opts.user)}</strong> — private repos you can access are shown. <a href="/dashboard/logout">Sign out</a></div>`
+		: `<div class="auth">` +
+			(opts.error ? `<span class="danger">Sign-in failed, please try again.</span> ` : "") +
 			`<span>Public repos only. </span>` +
-			`<input type="password" name="password" placeholder="admin password" aria-label="admin password">` +
-			`<button type="submit">Log in</button>` +
-			`</form>`;
+			(opts.configured
+				? `<a href="/dashboard/login">Sign in with GitHub</a> to also see private repos you have access to.`
+				: `<span class="lbl">(GitHub sign-in is not configured.)</span>`) +
+			`</div>`;
 
 	return `<!doctype html>
 <html lang="en">
