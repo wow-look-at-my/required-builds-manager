@@ -43,7 +43,37 @@ interface ReconcileState {
 	attempts: number;
 }
 
+// The coalesced publish a trailing flush will perform. Everything doPublish needs, captured at the time
+// the event was deferred (the flush re-mints its own token, so none is stored here).
+interface PendingPublish {
+	update: StatusUpdate;
+	owner: string;
+	repo: string;
+	sha: string;
+	context: string;
+	installationId: number;
+	appId: number;
+	ignore: string[];
+}
+
 const RECONCILE_KEY = "reconcile";
+// The last status we SUCCESSFULLY posted for this commit ({state, description, targetUrl}). Used to
+// suppress identical reposts (see publishIfChanged). Persisted across the long tail of a commit's
+// events (which can outlive an isolate), so it must live in DO storage, not memory.
+const LAST_PUBLISHED_KEY = "lastPublished";
+// Time-based debounce (a throttle: leading edge + trailing flush). The dedup above kills IDENTICAL
+// reposts; this additionally coalesces a burst of DISTINCT updates (a busy matrix ticking 1/29 -> 2/29
+// -> 3/29 failed within a second) so we publish at most once per window. Leading edge: the first event
+// in a quiet period publishes immediately, so the merge gate stays responsive. Within the window:
+// further events are stashed and a single trailing flush (via the alarm) publishes the latest. 1000ms --
+// the status lagging reality by up to a second is irrelevant to CI, and it sharply cuts the `status`
+// webhooks (and thus PR notifications) a large matrix produces.
+const PUBLISH_DEBOUNCE_MS = 1000;
+// The latest coalesced publish awaiting a trailing flush (present only between a deferred event and its
+// flush). Carries everything doPublish needs, since the flush runs later with no triggering event.
+const PENDING_PUBLISH_KEY = "pendingPublish";
+// Timestamp of the last actual publish (leading-edge or flushed); the throttle window is measured from it.
+const LAST_FLUSH_AT_KEY = "lastFlushAt";
 // First self-recheck this long after a pending publish; then exponential backoff up to the cap. Each
 // real event resets this (progress is happening), so the alarm only "takes over" once events stop.
 const RECONCILE_BASE_MS = 30_000;
@@ -75,6 +105,21 @@ function backoffMs(attempts: number): number {
 //    (30s -> 5min cap, ~12 attempts) while still pending and cancels itself once the result reaches a
 //    terminal state. (A status, unlike a completed check run, isn't frozen once terminal -- but a
 //    never-arriving terminal event still needs the alarm to drive it off "pending".)
+//
+// 3. Deduplication: a commit with many builds fires a torrent of events, most of which don't change the
+//    aggregate (a build moving in_progress -> completed when others are still running leaves the count
+//    untouched). Reposting an identical commit status is NOT a no-op on GitHub's side -- statuses are
+//    append-only per context, so every POST creates a new status object and fires a fresh `status`
+//    webhook, flooding subscribers with duplicate notifications. Both the event path and the alarm
+//    skip the POST when the {state, description, targetUrl} is identical to the last one we
+//    successfully published for this commit (see publishIfChanged).
+//
+// 4. Debounce (time-based throttle): dedup handles IDENTICAL reposts; this coalesces a burst of DISTINCT
+//    updates (a matrix ticking 1/29 -> 2/29 -> 3/29 failed within a second) into at most one publish per
+//    window. It's leading-edge: the first event in a quiet period publishes immediately (responsive
+//    merge gate); events within PUBLISH_DEBOUNCE_MS are stashed and a single trailing flush (driven by
+//    the same alarm) publishes the latest. dedup still runs at flush time, so a coalesced burst that
+//    nets out to no change posts nothing at all.
 export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 	async publish(
 		token: string,
@@ -91,40 +136,123 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 		await this.ctx.blockConcurrencyWhile(async () => {
 			if (measure) {
 				// Record the event-only-vs-list comparison and re-correct the store. Best-effort: a
-				// measurement failure must never block (or break) the actual publish.
+				// measurement failure must never block (or break) the actual publish. Runs per event,
+				// independent of the throttle below -- stats see every event.
 				try {
 					await this.measure(owner, repo, sha, update.targetUrl, measure);
 				} catch {
 					// swallow -- telemetry only
 				}
 			}
-			if (update.state === "pending") {
-				// Arm the safety net BEFORE publishing, so even a failed/dropped pending publish still
-				// gets re-checked by the alarm.
-				await this.armReconcile({
+
+			const now = Date.now();
+			const lastFlushAt = (await this.ctx.storage.get<number>(LAST_FLUSH_AT_KEY)) ?? 0;
+			if (now - lastFlushAt >= PUBLISH_DEBOUNCE_MS) {
+				// Leading edge: the window is open, so publish immediately (keeps the merge gate
+				// responsive). Any queued trailing flush is superseded by this fresher publish.
+				await this.ctx.storage.delete(PENDING_PUBLISH_KEY);
+				await this.doPublish(token, owner, repo, sha, context, update, appId, installationId, ignore);
+				// Mark the window only AFTER a successful publish, so a thrown publish (e.g. a 403 the
+				// handler retries with a fresh token) re-enters the leading edge instead of being deferred.
+				await this.ctx.storage.put<number>(LAST_FLUSH_AT_KEY, Date.now());
+			} else {
+				// Within the window: coalesce. Stash the latest desired publish and ensure a single
+				// trailing flush is scheduled at the window's end (never later than an already-set sooner
+				// alarm, e.g. a reconcile alarm).
+				await this.ctx.storage.put<PendingPublish>(PENDING_PUBLISH_KEY, {
+					update,
 					owner,
 					repo,
 					sha,
+					context,
 					installationId,
 					appId: appId ?? 0,
-					context,
 					ignore,
-					targetUrl: update.targetUrl,
 				});
-				await publishStatus(token, owner, repo, sha, context, update);
-			} else {
-				// Terminal: publish first, and only stop reconciling once the terminal state actually
-				// lands. If this publish throws, any armed alarm stays set and will retry.
-				await publishStatus(token, owner, repo, sha, context, update);
-				await this.clearReconcile();
+				const flushAt = lastFlushAt + PUBLISH_DEBOUNCE_MS;
+				const existing = await this.ctx.storage.getAlarm();
+				if (existing == null || existing > flushAt) {
+					await this.ctx.storage.setAlarm(flushAt);
+				}
 			}
 		});
 	}
 
-	// Re-query GitHub and re-publish when no event has resolved the status. Runs under the same
-	// single-threaded gate as publish() so the two can't race.
+	// Publishes one status and maintains the self-heal alarm. Arms the reconcile alarm BEFORE publishing
+	// so a failed publish -- pending OR terminal -- is retried by the alarm; clears it only once a
+	// terminal publish has actually landed. Shared by the leading-edge path and the trailing flush.
+	private async doPublish(
+		token: string,
+		owner: string,
+		repo: string,
+		sha: string,
+		context: string,
+		update: StatusUpdate,
+		appId: number | undefined,
+		installationId: number,
+		ignore: string[],
+	): Promise<void> {
+		await this.armReconcile({
+			owner,
+			repo,
+			sha,
+			installationId,
+			appId: appId ?? 0,
+			context,
+			ignore,
+			targetUrl: update.targetUrl,
+		});
+		await this.publishIfChanged(token, owner, repo, sha, context, update);
+		if (update.state !== "pending") {
+			// Terminal landed -- stop reconciling. (If publishIfChanged threw, we never reach here and the
+			// armed alarm retries.)
+			await this.clearReconcile();
+		}
+	}
+
+	// Two jobs, in priority order: (1) flush a debounced publish whose window has elapsed, then (2) the
+	// self-heal reconcile pass. Both run under the same single-threaded gate as publish() so none can
+	// race. A trailing-flush alarm is always sooner than any reconcile alarm, so when both are due this
+	// flush branch wins; the flush's doPublish then sets up the next reconcile alarm.
 	async alarm(): Promise<void> {
 		await this.ctx.blockConcurrencyWhile(async () => {
+			const pending = await this.ctx.storage.get<PendingPublish>(PENDING_PUBLISH_KEY);
+			if (pending) {
+				await this.ctx.storage.delete(PENDING_PUBLISH_KEY);
+				try {
+					const flush = async (forceRefresh: boolean): Promise<void> => {
+						const token = await getInstallationToken(this.env, pending.installationId, this.env.TOKEN_CACHE, forceRefresh);
+						await this.doPublish(
+							token,
+							pending.owner,
+							pending.repo,
+							pending.sha,
+							pending.context,
+							pending.update,
+							pending.appId || undefined,
+							pending.installationId,
+							pending.ignore,
+						);
+					};
+					try {
+						await flush(false);
+					} catch (err) {
+						// Stale cached token after a permissions change -- force a fresh one and retry once.
+						if ((err as { status?: number }).status === 403) {
+							await flush(true);
+						} else {
+							throw err;
+						}
+					}
+					await this.ctx.storage.put<number>(LAST_FLUSH_AT_KEY, Date.now());
+				} catch {
+					// The flush publish failed. doPublish armed the reconcile alarm before attempting, so the
+					// self-heal pass will retry (and re-publish) regardless of pending/terminal -- nothing
+					// more to do here.
+				}
+				return;
+			}
+
 			const s = await this.ctx.storage.get<ReconcileState>(RECONCILE_KEY);
 			if (!s) return;
 
@@ -143,7 +271,11 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 					s.appId || undefined,
 					{ context: s.context, ignore: s.ignore },
 				);
-				await publishStatus(token, s.owner, s.repo, s.sha, s.context, {
+				// Skip the POST if the re-aggregated status matches what we last published -- the alarm is
+				// a safety net for a MISSED transition, not a reason to re-emit an identical (still
+				// pending) status every backoff interval. Safe because we only record after a successful
+				// POST, so an equal record means GitHub provably already has this status.
+				await this.publishIfChanged(token, s.owner, s.repo, s.sha, s.context, {
 					state: result.state,
 					description: result.title,
 					targetUrl: s.targetUrl,
@@ -186,6 +318,33 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 			await this.ctx.storage.put<ReconcileState>(RECONCILE_KEY, { ...s, attempts });
 			await this.ctx.storage.setAlarm(Date.now() + backoffMs(attempts));
 		});
+	}
+
+	// Publishes the status only if it differs from the last one we SUCCESSFULLY posted for this commit,
+	// then records the new one. This is the debounce: identical reposts are dropped so they don't each
+	// create a new GitHub status object (and its `status` webhook + notification). We record only AFTER
+	// a successful POST, so a dropped/failed publish is never mistaken for "already sent" -- the caller's
+	// 403-retry and the reconcile alarm still re-attempt it. Returns whether a POST was actually made.
+	private async publishIfChanged(
+		token: string,
+		owner: string,
+		repo: string,
+		sha: string,
+		context: string,
+		update: StatusUpdate,
+	): Promise<boolean> {
+		const last = await this.ctx.storage.get<StatusUpdate>(LAST_PUBLISHED_KEY);
+		if (
+			last &&
+			last.state === update.state &&
+			last.description === update.description &&
+			last.targetUrl === update.targetUrl
+		) {
+			return false;
+		}
+		await publishStatus(token, owner, repo, sha, context, update);
+		await this.ctx.storage.put<StatusUpdate>(LAST_PUBLISHED_KEY, update);
+		return true;
 	}
 
 	// Compares the event-only prediction against the authoritative list, records the outcome, then
