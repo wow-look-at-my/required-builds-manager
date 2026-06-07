@@ -124,4 +124,76 @@ describe("publishViaCoordinator (Durable Object)", () => {
 		const reconcile = await runInDurableObject(stub, (_i, state) => state.storage.get("reconcile"));
 		expect(reconcile).toBeUndefined();
 	});
+
+	// Deduplication (the debounce): a commit with many builds fires a torrent of events that don't
+	// change the aggregate. Without this guard each one reposts an identical commit status, and since
+	// statuses are append-only per context every repost creates a new status -> a fresh `status` webhook
+	// -> a duplicate notification (the flood this fixes).
+
+	it("suppresses an identical repost (does not POST the same status twice)", async () => {
+		// Only ONE POST interceptor is registered. If the identical second publish tried to POST,
+		// fetchMock would have nothing to match it and the test would fail; afterEach's
+		// assertNoPendingInterceptors() additionally confirms that one POST was consumed exactly once.
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: "/repos/o/r/statuses/dedup-sha", method: "POST" })
+			.reply(201, { id: 1 });
+
+		const update = { state: "failure" as const, description: "2/29 builds failed", targetUrl };
+		const namespace = ns();
+		await publishViaCoordinator(namespace, "token", "o", "r", "dedup-sha", "all-builds", update, 99999, 12345, []);
+		await publishViaCoordinator(namespace, "token", "o", "r", "dedup-sha", "all-builds", update, 99999, 12345, []);
+	});
+
+	it("reposts when the aggregate changes (a different count is not a duplicate)", async () => {
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: "/repos/o/r/statuses/change-sha", method: "POST" })
+			.reply(201, { id: 1 })
+			.times(2);
+
+		const namespace = ns();
+		await publishViaCoordinator(namespace, "token", "o", "r", "change-sha", "all-builds", { state: "failure" as const, description: "1/29 builds failed", targetUrl }, 99999, 12345, []);
+		await publishViaCoordinator(namespace, "token", "o", "r", "change-sha", "all-builds", { state: "failure" as const, description: "2/29 builds failed", targetUrl }, 99999, 12345, []);
+	});
+
+	it("the reconcile alarm does not repost an unchanged (still pending) status", async () => {
+		const cache = (env as unknown as { TOKEN_CACHE: KVNamespace }).TOKEN_CACHE;
+		await cache.put(
+			"installation-token:12345",
+			JSON.stringify({ token: "cached-token", expiresAt: Math.floor(Date.now() / 1000) + 3600 }),
+		);
+
+		// The initial pending publish POSTs once and records "0/1 builds passed".
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: "/repos/o/r/statuses/heal-pending-sha", method: "POST" })
+			.reply(201, { id: 1 });
+		// The alarm re-aggregates and finds the SAME pending state (one in-progress check run -> still
+		// "0/1 builds passed"), so it must NOT POST again. No second POST interceptor is registered, so a
+		// repost would fail the test; only the GET listings are mocked.
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: /^\/repos\/o\/r\/statuses\/heal-pending-sha\?/, method: "GET" })
+			.reply(200, []);
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: /^\/repos\/o\/r\/commits\/heal-pending-sha\/check-runs/, method: "GET" })
+			.reply(200, { check_runs: [{ name: "build", status: "in_progress", conclusion: null }] });
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: /^\/repos\/o\/r\/actions\/runs/, method: "GET" })
+			.reply(200, { workflow_runs: [] });
+
+		const namespace = ns();
+		await publishViaCoordinator(namespace, "token", "o", "r", "heal-pending-sha", "all-builds", { state: "pending" as const, description: "0/1 builds passed", targetUrl }, 99999, 12345, []);
+
+		const stub = namespace.get(namespace.idFromName("o/r@heal-pending-sha"));
+		const ran = await runDurableObjectAlarm(stub);
+		expect(ran).toBe(true);
+
+		// Still pending and unchanged: the alarm skipped the repost but stays armed for another attempt.
+		const reconcile = await runInDurableObject(stub, (_i, state) => state.storage.get("reconcile"));
+		expect(reconcile).toBeDefined();
+	});
 });

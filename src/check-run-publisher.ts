@@ -27,6 +27,10 @@ interface ReconcileState {
 }
 
 const RECONCILE_KEY = "reconcile";
+// The last status we SUCCESSFULLY posted for this commit ({state, description, targetUrl}). Used to
+// suppress identical reposts (see publishIfChanged). Persisted across the long tail of a commit's
+// events (which can outlive an isolate), so it must live in DO storage, not memory.
+const LAST_PUBLISHED_KEY = "lastPublished";
 // First self-recheck this long after a pending publish; then exponential backoff up to the cap. Each
 // real event resets this (progress is happening), so the alarm only "takes over" once events stop.
 const RECONCILE_BASE_MS = 30_000;
@@ -58,6 +62,14 @@ function backoffMs(attempts: number): number {
 //    (30s -> 5min cap, ~12 attempts) while still pending and cancels itself once the result reaches a
 //    terminal state. (A status, unlike a completed check run, isn't frozen once terminal -- but a
 //    never-arriving terminal event still needs the alarm to drive it off "pending".)
+//
+// 3. Deduplication: a commit with many builds fires a torrent of events, most of which don't change the
+//    aggregate (a build moving in_progress -> completed when others are still running leaves the count
+//    untouched). Reposting an identical commit status is NOT a no-op on GitHub's side -- statuses are
+//    append-only per context, so every POST creates a new status object and fires a fresh `status`
+//    webhook, flooding subscribers with duplicate notifications. Both the event path and the alarm
+//    skip the POST when the {state, description, targetUrl} is identical to the last one we
+//    successfully published for this commit (see publishIfChanged).
 export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 	async publish(
 		token: string,
@@ -72,8 +84,10 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 	): Promise<void> {
 		await this.ctx.blockConcurrencyWhile(async () => {
 			if (update.state === "pending") {
-				// Arm the safety net BEFORE publishing, so even a failed/dropped pending publish still
-				// gets re-checked by the alarm.
+				// Arm the safety net BEFORE (maybe) publishing, so even a failed/dropped pending publish
+				// still gets re-checked by the alarm. Arming is independent of whether this particular
+				// event actually reposts -- a flood of identical pending events still keeps the alarm
+				// alive, and it only fires once events go quiet.
 				await this.armReconcile({
 					owner,
 					repo,
@@ -84,11 +98,11 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 					ignore,
 					targetUrl: update.targetUrl,
 				});
-				await publishStatus(token, owner, repo, sha, context, update);
+				await this.publishIfChanged(token, owner, repo, sha, context, update);
 			} else {
-				// Terminal: publish first, and only stop reconciling once the terminal state actually
-				// lands. If this publish throws, any armed alarm stays set and will retry.
-				await publishStatus(token, owner, repo, sha, context, update);
+				// Terminal: (maybe) publish first, and only stop reconciling once the terminal state
+				// actually lands. If this publish throws, any armed alarm stays set and will retry.
+				await this.publishIfChanged(token, owner, repo, sha, context, update);
 				await this.clearReconcile();
 			}
 		});
@@ -116,7 +130,11 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 					s.appId || undefined,
 					{ context: s.context, ignore: s.ignore },
 				);
-				await publishStatus(token, s.owner, s.repo, s.sha, s.context, {
+				// Skip the POST if the re-aggregated status matches what we last published -- the alarm is
+				// a safety net for a MISSED transition, not a reason to re-emit an identical (still
+				// pending) status every backoff interval. Safe because we only record after a successful
+				// POST, so an equal record means GitHub provably already has this status.
+				await this.publishIfChanged(token, s.owner, s.repo, s.sha, s.context, {
 					state: result.state,
 					description: result.title,
 					targetUrl: s.targetUrl,
@@ -159,6 +177,33 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 			await this.ctx.storage.put<ReconcileState>(RECONCILE_KEY, { ...s, attempts });
 			await this.ctx.storage.setAlarm(Date.now() + backoffMs(attempts));
 		});
+	}
+
+	// Publishes the status only if it differs from the last one we SUCCESSFULLY posted for this commit,
+	// then records the new one. This is the debounce: identical reposts are dropped so they don't each
+	// create a new GitHub status object (and its `status` webhook + notification). We record only AFTER
+	// a successful POST, so a dropped/failed publish is never mistaken for "already sent" -- the caller's
+	// 403-retry and the reconcile alarm still re-attempt it. Returns whether a POST was actually made.
+	private async publishIfChanged(
+		token: string,
+		owner: string,
+		repo: string,
+		sha: string,
+		context: string,
+		update: StatusUpdate,
+	): Promise<boolean> {
+		const last = await this.ctx.storage.get<StatusUpdate>(LAST_PUBLISHED_KEY);
+		if (
+			last &&
+			last.state === update.state &&
+			last.description === update.description &&
+			last.targetUrl === update.targetUrl
+		) {
+			return false;
+		}
+		await publishStatus(token, owner, repo, sha, context, update);
+		await this.ctx.storage.put<StatusUpdate>(LAST_PUBLISHED_KEY, update);
+		return true;
 	}
 
 	private async armReconcile(s: Omit<ReconcileState, "attempts">): Promise<void> {
