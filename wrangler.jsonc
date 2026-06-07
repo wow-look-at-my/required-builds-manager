@@ -7,11 +7,13 @@
 	],
 	"durable_objects": {
 		"bindings": [
-			{ "name": "CHECK_RUN_PUBLISHER", "class_name": "CheckRunPublisher" }
+			{ "name": "CHECK_RUN_PUBLISHER", "class_name": "CheckRunPublisher" },
+			{ "name": "STATS_RECORDER", "class_name": "StatsRecorder" }
 		]
 	},
 	"migrations": [
-		{ "tag": "v1", "new_sqlite_classes": ["CheckRunPublisher"] }
+		{ "tag": "v1", "new_sqlite_classes": ["CheckRunPublisher"] },
+		{ "tag": "v2", "new_sqlite_classes": ["StatsRecorder"] }
 	],
 	"observability": {
 		"traces": {

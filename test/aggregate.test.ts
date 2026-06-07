@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { computeAllBuildsState } from "../src/aggregate";
+import { computeAllBuildsState, enrichWithSteps } from "../src/aggregate";
 import * as github from "../src/github";
 
 vi.mock("../src/github", () => ({
@@ -762,10 +762,30 @@ describe("computeAllBuildsState", () => {
 		});
 	});
 
-	// Per-step breakdown: for a failed or in-progress Actions job, surface its individual steps so the
-	// summary shows exactly which step failed or is running.
+	// Per-step breakdown: enrichWithSteps fetches a failed/in-progress Actions job's individual steps
+	// so the breakdown page shows exactly which step failed or is running. It is a SEPARATE pass from
+	// computeAllBuildsState (which the hot webhook path uses and which must NOT make these per-job
+	// calls) — only the breakdown page render invokes it.
 	describe("per-step breakdown for failed / in-progress jobs", () => {
 		const jobUrl = "https://github.com/o/r/actions/runs/123/job/456";
+
+		it("computeAllBuildsState alone does not fetch job steps (webhook path stays cheap)", async () => {
+			// Regression guard for the optimization: computing state must not cost a getWorkflowJob call
+			// per job, since the published status uses only state + title. Steps come from the separate
+			// enrichWithSteps pass below, run only when the breakdown page is rendered.
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "failure", details_url: jobUrl },
+			]);
+			mockedGetWorkflowJob.mockResolvedValue({
+				steps: [{ name: "Run build", status: "completed", conclusion: "failure", number: 1 }],
+			});
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+
+			expect(result.state).toBe("failure");
+			expect(mockedGetWorkflowJob).not.toHaveBeenCalled();
+			expect(result.failed[0].steps).toBeUndefined();
+		});
 
 		it("shows the individual steps of a failed job, flagging the failed step", async () => {
 			mockedListCheckRuns.mockResolvedValue([
@@ -780,6 +800,7 @@ describe("computeAllBuildsState", () => {
 			});
 
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+			await enrichWithSteps("token", "owner", "repo", result);
 
 			expect(result.state).toBe("failure");
 			// The Actions job id is parsed from the check run URL.
@@ -803,6 +824,7 @@ describe("computeAllBuildsState", () => {
 			});
 
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "pending", "deploy");
+			await enrichWithSteps("token", "owner", "repo", result);
 
 			expect(result.state).toBe("pending");
 			expect(result.pending[0].steps).toEqual([
@@ -817,6 +839,7 @@ describe("computeAllBuildsState", () => {
 			]);
 
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "build");
+			await enrichWithSteps("token", "owner", "repo", result);
 
 			expect(result.state).toBe("success");
 			expect(mockedGetWorkflowJob).not.toHaveBeenCalled();
@@ -828,6 +851,7 @@ describe("computeAllBuildsState", () => {
 			]);
 
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+			await enrichWithSteps("token", "owner", "repo", result);
 
 			expect(result.state).toBe("failure");
 			expect(mockedGetWorkflowJob).not.toHaveBeenCalled();
@@ -840,6 +864,7 @@ describe("computeAllBuildsState", () => {
 			mockedGetWorkflowJob.mockRejectedValue(new Error("boom"));
 
 			const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "other");
+			await enrichWithSteps("token", "owner", "repo", result);
 
 			expect(result.state).toBe("failure");
 			expect(result.failed[0].name).toBe("build");

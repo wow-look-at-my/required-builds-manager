@@ -1,21 +1,44 @@
 import { verifySignature } from "./verify";
-import { computeAllBuildsState, type IncomingDetail } from "./aggregate";
-import { publishViaCoordinator, type CheckRunPublisher } from "./check-run-publisher";
+import { computeAllBuildsState, enrichWithSteps, type IncomingDetail } from "./aggregate";
+import { publishViaCoordinator, type CheckRunPublisher, type MeasurePayload } from "./check-run-publisher";
 import { getInstallationToken, getInstallationId } from "./auth";
-import { getRepoConfig } from "./config";
+import { getRepoConfig, matchesIgnorePattern } from "./config";
 import { signResource, verifyResource } from "./sign";
 import { renderBreakdownHtml } from "./render";
+import { toSimpleState, type BuildKind } from "./predict";
+import { getStatsSummary, filterSummaryForViewer, type StatsRecorder, type StatsSummary } from "./stats";
+import { renderDashboardHtml } from "./dashboard";
+import {
+	oauthConfigured,
+	authorizeUrl,
+	randomState,
+	issueStateCookie,
+	clearStateCookie,
+	verifyState,
+	exchangeCode,
+	fetchLogin,
+	canAccessRepo,
+	issueSessionCookie,
+	clearSessionCookie,
+	readSession,
+} from "./session";
 
-// The Durable Object class must be exported from the Worker's entry module so the runtime can
-// instantiate it (see the durable_objects binding in wrangler.jsonc).
+// The Durable Object classes must be exported from the Worker's entry module so the runtime can
+// instantiate them (see the durable_objects bindings in wrangler.jsonc).
 export { CheckRunPublisher } from "./check-run-publisher";
+export { StatsRecorder } from "./stats";
 
 interface Env {
 	GITHUB_APP_ID: string;
 	GITHUB_APP_PRIVATE_KEY: string;
 	WEBHOOK_SECRET: string;
+	// GitHub App OAuth client credentials for "Sign in with GitHub" on the stats dashboard. When unset,
+	// the dashboard is public-only (no sign-in possible).
+	GITHUB_CLIENT_ID?: string;
+	GITHUB_CLIENT_SECRET?: string;
 	TOKEN_CACHE?: KVNamespace;
 	CHECK_RUN_PUBLISHER: DurableObjectNamespace<CheckRunPublisher>;
+	STATS_RECORDER: DurableObjectNamespace<StatsRecorder>;
 }
 
 interface StatusEvent {
@@ -26,6 +49,7 @@ interface StatusEvent {
 	target_url: string | null;
 	repository: {
 		full_name: string;
+		private: boolean;
 	};
 	installation?: {
 		id: number;
@@ -46,6 +70,7 @@ interface CheckRunEvent {
 	};
 	repository: {
 		full_name: string;
+		private: boolean;
 	};
 	installation?: {
 		id: number;
@@ -63,6 +88,7 @@ interface WorkflowRunEvent {
 	};
 	repository: {
 		full_name: string;
+		private: boolean;
 	};
 	installation?: {
 		id: number;
@@ -122,6 +148,12 @@ export default {
 			return serveBreakdown(request, env, url);
 		}
 
+		// Stats dashboard: "are the list calls required?" Public repos to everyone; private repos and
+		// their receipts only to a logged-in admin.
+		if (url.pathname === "/dashboard" || url.pathname.startsWith("/dashboard/")) {
+			return serveDashboardRoutes(request, env, url);
+		}
+
 		if (request.method !== "POST") {
 			return new Response("Method not allowed", { status: 405 });
 		}
@@ -153,6 +185,7 @@ export default {
 		let fullName: string;
 		let installationId: number | undefined;
 		let incomingAppId: number | undefined;
+		let isPrivate = false;
 		const incoming: IncomingDetail = {};
 
 		if (event === "status") {
@@ -161,6 +194,7 @@ export default {
 			incomingState = payload.state;
 			incomingContext = payload.context;
 			fullName = payload.repository.full_name;
+			isPrivate = payload.repository.private;
 			installationId = payload.installation?.id;
 			incoming.kind = "status";
 			incoming.detail = payload.description ?? undefined;
@@ -171,6 +205,7 @@ export default {
 			incomingState = mapCheckRunState(payload.check_run.status, payload.check_run.conclusion);
 			incomingContext = payload.check_run.name;
 			fullName = payload.repository.full_name;
+			isPrivate = payload.repository.private;
 			installationId = payload.installation?.id;
 			incomingAppId = payload.check_run.app?.id;
 			incoming.kind = "check";
@@ -182,6 +217,7 @@ export default {
 			incomingState = mapWorkflowRunState(payload.workflow_run.status, payload.workflow_run.conclusion);
 			incomingContext = payload.workflow_run.name ?? "";
 			fullName = payload.repository.full_name;
+			isPrivate = payload.repository.private;
 			installationId = payload.installation?.id;
 			incoming.kind = "workflow";
 			incoming.detail = payload.workflow_run.conclusion ?? undefined;
@@ -253,6 +289,24 @@ export default {
 			targetUrl: `${url.origin}/b/${owner}/${repo}/${sha}?k=${sig}`,
 		};
 
+		// Measure the event-only prediction against this authoritative listing (recorded inside the DO;
+		// surfaced on the /dashboard page). It reuses data we already have -- no extra GitHub calls. The
+		// triggering build is only attributable when it isn't ignored (own-context events returned above).
+		const incomingIgnored = matchesIgnorePattern(incomingContext, config.ignore);
+		const measure: MeasurePayload = {
+			incoming:
+				incomingIgnored || !incoming.kind
+					? null
+					: { kind: incoming.kind as BuildKind, name: incomingContext, state: toSimpleState(incomingState) },
+			actualBuilds: [...result.failed, ...result.pending, ...result.passed].map((e) => ({
+				kind: e.kind,
+				name: e.name,
+				state: e.state,
+			})),
+			actualState: result.state,
+			isPrivate,
+		};
+
 		// Route through the per-commit Durable Object so simultaneous build events serialize (last to
 		// arrive wins, no interleaved stale publish) and the self-heal alarm can re-publish if a
 		// terminal event is missed. installationId + ignore patterns + target_url are carried so the
@@ -269,6 +323,7 @@ export default {
 				appId,
 				installationId,
 				config.ignore,
+				measure,
 			);
 
 		try {
@@ -342,6 +397,9 @@ async function serveBreakdown(request: Request, env: Env, url: URL): Promise<Res
 			Number.isNaN(appId) ? undefined : appId,
 			config,
 		);
+		// Only the breakdown page needs per-step detail, so the per-job getWorkflowJob calls happen
+		// here (rare, human-triggered) rather than on every webhook event (see enrichWithSteps).
+		await enrichWithSteps(token, owner, repo, result);
 		html = renderBreakdownHtml(owner, repo, sha, result);
 	} catch {
 		html = renderBreakdownHtml(owner, repo, sha, {
@@ -362,4 +420,89 @@ async function serveBreakdown(request: Request, env: Env, url: URL): Promise<Res
 			"Cache-Control": "no-store",
 		},
 	});
+}
+
+// Dashboard routes: GET /dashboard (render), GET /dashboard/login (-> GitHub authorize), GET
+// /dashboard/callback (OAuth code exchange -> session cookie), GET /dashboard/logout (clear it).
+// "Signed in" is a per-user GitHub OAuth session (see session.ts): public repos show to everyone, and a
+// signed-in user additionally sees the private repos their own GitHub account can access.
+async function serveDashboardRoutes(request: Request, env: Env, url: URL): Promise<Response> {
+	const path = url.pathname;
+
+	// Begin sign-in: redirect to GitHub's authorize page, carrying a signed CSRF state cookie.
+	if (path === "/dashboard/login" && request.method === "GET") {
+		if (!oauthConfigured(env)) return redirect("/dashboard");
+		const state = randomState();
+		return redirect(authorizeUrl(env, url.origin, state), [
+			await issueStateCookie(env.WEBHOOK_SECRET, state, Date.now()),
+		]);
+	}
+
+	// OAuth callback: verify the state, exchange the code for a (single-use) user token, compute which of
+	// our tracked private repos that token can read, and store that allow-list in a signed session cookie.
+	if (path === "/dashboard/callback" && request.method === "GET") {
+		const code = url.searchParams.get("code") ?? "";
+		const state = url.searchParams.get("state") ?? "";
+		const cookie = request.headers.get("Cookie");
+		if (!oauthConfigured(env) || !code || !(await verifyState(env.WEBHOOK_SECRET, cookie, state, Date.now()))) {
+			return redirect("/dashboard?e=1", [clearStateCookie()]);
+		}
+		const token = await exchangeCode(env, code, url.origin);
+		if (!token) return redirect("/dashboard?e=1", [clearStateCookie()]);
+		const login = (await fetchLogin(token)) ?? "";
+
+		// Of the private repos we track, keep only the ones this user's token can actually read.
+		let allowed: string[] = [];
+		try {
+			const all = await getStatsSummary(env.STATS_RECORDER, true);
+			const privateRepos = all.repos.filter((r) => r.isPrivate).map((r) => r.fullName);
+			const checks = await Promise.all(
+				privateRepos.map(async (fn) => ((await canAccessRepo(token, fn)) ? fn : null)),
+			);
+			allowed = checks.filter((x): x is string => x !== null);
+		} catch {
+			allowed = [];
+		}
+
+		const session = await issueSessionCookie(env.WEBHOOK_SECRET, { login, repos: allowed }, Date.now());
+		return redirect("/dashboard", [session, clearStateCookie()]);
+	}
+
+	if (path === "/dashboard/logout") {
+		return redirect("/dashboard", [clearSessionCookie()]);
+	}
+
+	if (path === "/dashboard" && request.method === "GET") {
+		const session = await readSession(env.WEBHOOK_SECRET, request.headers.get("Cookie"), Date.now());
+		let summary: StatsSummary;
+		try {
+			const full = await getStatsSummary(env.STATS_RECORDER, !!session);
+			summary = session ? filterSummaryForViewer(full, session.repos) : full;
+		} catch {
+			// A stats-store failure must not take down the dashboard -- show an empty board.
+			summary = { total: 0, agree: 0, disagree: 0, repos: [], receipts: [] };
+		}
+		const html = renderDashboardHtml(summary, {
+			user: session?.login,
+			configured: oauthConfigured(env),
+			error: url.searchParams.get("e") === "1",
+		});
+		return new Response(html, {
+			status: 200,
+			headers: {
+				"Content-Type": "text/html; charset=utf-8",
+				"Referrer-Policy": "no-referrer",
+				"Cache-Control": "no-store",
+			},
+		});
+	}
+
+	return new Response("Method not allowed", { status: 405 });
+}
+
+// 303 See Other redirect, optionally setting one or more cookies.
+function redirect(location: string, setCookies?: string[]): Response {
+	const headers = new Headers({ Location: location });
+	for (const c of setCookies ?? []) headers.append("Set-Cookie", c);
+	return new Response(null, { status: 303, headers });
 }
