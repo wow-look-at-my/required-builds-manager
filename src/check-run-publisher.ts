@@ -1,46 +1,259 @@
 import { DurableObject } from "cloudflare:workers";
-import { publishCheckRun, type CheckRunOutput } from "./github";
+import { publishStatus, type StatusUpdate } from "./github";
+import { computeAllBuildsState } from "./aggregate";
+import { getInstallationToken } from "./auth";
+import { applyIncoming, compare, type IncomingBuild, type PredBuild, type SimpleState } from "./predict";
+import { recordMeasurement, type StatsRecorder } from "./stats";
 
-// Durable Object used purely to serialize check-run publishing per commit. GitHub has no
-// upsert-by-name for check runs, so without serialization, simultaneous build events (e.g. a whole
-// matrix finishing at once) would each look up "no existing run" and create a duplicate "all-builds"
-// run — and those duplicates can't be deleted. Routing every publish for a given SHA through one DO
-// instance (keyed by owner/repo@sha) and wrapping the find-or-update in `blockConcurrencyWhile`
-// guarantees each publish runs to completion before the next event is delivered: the first event
-// creates the run, the rest update it in place. Result: exactly one entry per commit.
-export class CheckRunPublisher extends DurableObject {
+// Bindings the DO needs to mint a fresh token and re-aggregate during a reconciliation alarm, plus the
+// global stats DO that records the event-only-vs-list comparison.
+interface PublisherEnv {
+	GITHUB_APP_ID: string;
+	GITHUB_APP_PRIVATE_KEY: string;
+	TOKEN_CACHE?: KVNamespace;
+	STATS_RECORDER?: DurableObjectNamespace<StatsRecorder>;
+}
+
+// Everything the per-commit comparison needs: the triggering build reduced to a single state (null when
+// the event isn't measurable, e.g. an ignored context), the authoritative per-build listing the worker
+// is about to publish, that listing's combined state, and the repo's visibility (for the dashboard).
+export interface MeasurePayload {
+	incoming: IncomingBuild | null;
+	actualBuilds: PredBuild[];
+	actualState: SimpleState | "error";
+	isPrivate: boolean;
+}
+
+// DO storage key for the event-only build-state store, kept corrected to the latest list per commit.
+const EVENTSTORE_KEY = "eventstore";
+
+// Everything the reconciliation alarm needs to re-aggregate a commit from scratch (with no triggering
+// event) and re-publish its status. Persisted in DO storage only while the result is non-terminal.
+interface ReconcileState {
+	owner: string;
+	repo: string;
+	sha: string;
+	installationId: number;
+	appId: number;
+	context: string;
+	ignore: string[];
+	// The capability URL for this commit's breakdown page. It's constant per SHA, so the alarm reuses
+	// it rather than re-signing.
+	targetUrl: string;
+	attempts: number;
+}
+
+const RECONCILE_KEY = "reconcile";
+// First self-recheck this long after a pending publish; then exponential backoff up to the cap. Each
+// real event resets this (progress is happening), so the alarm only "takes over" once events stop.
+const RECONCILE_BASE_MS = 30_000;
+const RECONCILE_MAX_MS = 300_000;
+// Stop re-checking after this many attempts (~tens of minutes). By then real builds have finished;
+// anything still pending is a genuinely stuck external check, not a dropped event we can heal.
+const RECONCILE_MAX_ATTEMPTS = 12;
+
+function backoffMs(attempts: number): number {
+	return Math.min(RECONCILE_BASE_MS * 2 ** attempts, RECONCILE_MAX_MS);
+}
+
+// Durable Object that serializes commit-status publishing per commit AND self-heals stuck results.
+//
+// (The class name predates the switch from check runs to commit statuses; it's kept to avoid a
+// Durable Object migration rename.)
+//
+// 1. Serialization: GitHub upserts commit statuses by context, so duplicates aren't a problem the way
+//    they were for check runs -- but concurrent events for one SHA can still interleave their
+//    fetch+POST so an EARLIER-aggregated state lands last, leaving a stale status. Routing every
+//    publish for a SHA through one DO (keyed by owner/repo@sha) and wrapping it in
+//    `blockConcurrencyWhile` makes events for one commit run one-at-a-time, so the last to arrive wins.
+//
+// 2. Self-heal (reconciliation): the worker is otherwise purely event-driven, so if the terminal event
+//    is dropped, reordered behind a stale event, or its publish fails transiently, the status freezes
+//    on "pending" forever. To prevent that, whenever a *pending* result is published the DO arms an
+//    `alarm`; when it fires it mints a fresh token, re-aggregates from the authoritative listing (no
+//    incoming event -- nothing is folded in), and re-publishes. It re-arms with exponential backoff
+//    (30s -> 5min cap, ~12 attempts) while still pending and cancels itself once the result reaches a
+//    terminal state. (A status, unlike a completed check run, isn't frozen once terminal -- but a
+//    never-arriving terminal event still needs the alarm to drive it off "pending".)
+export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 	async publish(
 		token: string,
 		owner: string,
 		repo: string,
 		sha: string,
-		name: string,
-		status: "in_progress" | "completed",
-		conclusion: string | null,
-		output: CheckRunOutput,
-		appId?: number,
+		context: string,
+		update: StatusUpdate,
+		appId: number | undefined,
+		installationId: number,
+		ignore: string[],
+		measure?: MeasurePayload,
 	): Promise<void> {
 		await this.ctx.blockConcurrencyWhile(async () => {
-			await publishCheckRun(token, owner, repo, sha, name, status, conclusion, output, appId);
+			if (measure) {
+				// Record the event-only-vs-list comparison and re-correct the store. Best-effort: a
+				// measurement failure must never block (or break) the actual publish.
+				try {
+					await this.measure(owner, repo, sha, update.targetUrl, measure);
+				} catch {
+					// swallow -- telemetry only
+				}
+			}
+			if (update.state === "pending") {
+				// Arm the safety net BEFORE publishing, so even a failed/dropped pending publish still
+				// gets re-checked by the alarm.
+				await this.armReconcile({
+					owner,
+					repo,
+					sha,
+					installationId,
+					appId: appId ?? 0,
+					context,
+					ignore,
+					targetUrl: update.targetUrl,
+				});
+				await publishStatus(token, owner, repo, sha, context, update);
+			} else {
+				// Terminal: publish first, and only stop reconciling once the terminal state actually
+				// lands. If this publish throws, any armed alarm stays set and will retry.
+				await publishStatus(token, owner, repo, sha, context, update);
+				await this.clearReconcile();
+			}
 		});
+	}
+
+	// Re-query GitHub and re-publish when no event has resolved the status. Runs under the same
+	// single-threaded gate as publish() so the two can't race.
+	async alarm(): Promise<void> {
+		await this.ctx.blockConcurrencyWhile(async () => {
+			const s = await this.ctx.storage.get<ReconcileState>(RECONCILE_KEY);
+			if (!s) return;
+
+			// One reconcile pass: mint a token (optionally forced fresh), re-aggregate from the
+			// authoritative listing (no triggering event -- the all-builds context is always skipped, so
+			// nothing is folded in), and re-publish the status with the (constant) capability URL.
+			const attempt = async (forceRefresh: boolean): Promise<"resolved" | "pending"> => {
+				const token = await getInstallationToken(this.env, s.installationId, this.env.TOKEN_CACHE, forceRefresh);
+				const result = await computeAllBuildsState(
+					token,
+					s.owner,
+					s.repo,
+					s.sha,
+					"success",
+					s.context,
+					s.appId || undefined,
+					{ context: s.context, ignore: s.ignore },
+				);
+				await publishStatus(token, s.owner, s.repo, s.sha, s.context, {
+					state: result.state,
+					description: result.title,
+					targetUrl: s.targetUrl,
+				});
+				return result.state === "pending" ? "pending" : "resolved";
+			};
+
+			try {
+				let outcome: "resolved" | "pending";
+				try {
+					outcome = await attempt(false);
+				} catch (err) {
+					// A 403 may just be a stale cached token from before a permissions change -- force a
+					// fresh one and retry once.
+					if ((err as { status?: number }).status === 403) {
+						outcome = await attempt(true);
+					} else {
+						throw err;
+					}
+				}
+				if (outcome === "resolved") {
+					await this.ctx.storage.delete(RECONCILE_KEY);
+					return;
+				}
+			} catch (err) {
+				// A 403 that survives a forced token refresh is a real, unfixable permission problem (the
+				// installation genuinely lacks `statuses:write`) -- stop rather than hammer GitHub.
+				if ((err as { status?: number }).status === 403) {
+					await this.ctx.storage.delete(RECONCILE_KEY);
+					return;
+				}
+				// Otherwise transient -- fall through to re-arm and try again.
+			}
+
+			const attempts = s.attempts + 1;
+			if (attempts >= RECONCILE_MAX_ATTEMPTS) {
+				await this.ctx.storage.delete(RECONCILE_KEY);
+				return;
+			}
+			await this.ctx.storage.put<ReconcileState>(RECONCILE_KEY, { ...s, attempts });
+			await this.ctx.storage.setAlarm(Date.now() + backoffMs(attempts));
+		});
+	}
+
+	// Compares the event-only prediction against the authoritative list, records the outcome, then
+	// re-corrects the stored snapshot to reality. The store starts from the LAST list snapshot, so the
+	// prediction is "known-good snapshot + just this one event" -- the fairest test of events-alone.
+	// A disagreement is a receipt that the list call learned something this event didn't carry.
+	private async measure(
+		owner: string,
+		repo: string,
+		sha: string,
+		targetUrl: string,
+		m: MeasurePayload,
+	): Promise<void> {
+		if (m.actualState === "error") return; // aggregation failed -- nothing meaningful to compare
+		const prev = (await this.ctx.storage.get<PredBuild[]>(EVENTSTORE_KEY)) ?? [];
+		const predicted = m.incoming ? applyIncoming(prev, m.incoming) : prev;
+
+		// Only record when there's a real triggering build to attribute (an ignored/own event still
+		// re-corrects the store below, but isn't itself a "was this event enough?" data point).
+		if (m.incoming && this.env.STATS_RECORDER) {
+			const cmp = compare(predicted, m.actualBuilds, m.actualState);
+			await recordMeasurement(this.env.STATS_RECORDER, {
+				fullName: `${owner}/${repo}`,
+				isPrivate: m.isPrivate,
+				sha,
+				at: Date.now(),
+				agree: cmp.agree,
+				predicted: cmp.predicted,
+				actual: cmp.actual,
+				reason: cmp.reason,
+				direction: cmp.direction,
+				detail: cmp.detail,
+				targetUrl,
+			});
+		}
+
+		// Keep the store corrected to reality for the next event.
+		await this.ctx.storage.put<PredBuild[]>(EVENTSTORE_KEY, m.actualBuilds);
+	}
+
+	private async armReconcile(s: Omit<ReconcileState, "attempts">): Promise<void> {
+		// Reset attempts on every real event -- progress is happening, so restart the backoff clock.
+		await this.ctx.storage.put<ReconcileState>(RECONCILE_KEY, { ...s, attempts: 0 });
+		await this.ctx.storage.setAlarm(Date.now() + RECONCILE_BASE_MS);
+	}
+
+	private async clearReconcile(): Promise<void> {
+		await this.ctx.storage.delete(RECONCILE_KEY);
+		await this.ctx.storage.deleteAlarm();
 	}
 }
 
-// Routes a publish through the per-commit Durable Object so concurrent events serialize. The DO id
-// is derived from owner/repo@sha, so all events for one commit share a single coordinator instance.
+// Routes a publish through the per-commit Durable Object so concurrent events serialize. The DO id is
+// derived from owner/repo@sha, so all events for one commit share a single coordinator instance.
 export async function publishViaCoordinator(
 	namespace: DurableObjectNamespace<CheckRunPublisher>,
 	token: string,
 	owner: string,
 	repo: string,
 	sha: string,
-	name: string,
-	status: "in_progress" | "completed",
-	conclusion: string | null,
-	output: CheckRunOutput,
-	appId?: number,
+	context: string,
+	update: StatusUpdate,
+	appId: number | undefined,
+	installationId: number,
+	ignore: string[],
+	measure?: MeasurePayload,
 ): Promise<void> {
 	const id = namespace.idFromName(`${owner}/${repo}@${sha}`);
 	const stub = namespace.get(id);
-	await stub.publish(token, owner, repo, sha, name, status, conclusion, output, appId);
+	await stub.publish(token, owner, repo, sha, context, update, appId, installationId, ignore, measure);
 }

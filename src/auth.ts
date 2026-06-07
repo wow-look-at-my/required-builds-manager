@@ -16,6 +16,10 @@ export async function getInstallationToken(
 	env: Pick<AppEnv, "GITHUB_APP_ID" | "GITHUB_APP_PRIVATE_KEY">,
 	installationId: number,
 	kv?: KVNamespace,
+	// Skip the caches and mint a brand-new token. Installation tokens capture the installation's
+	// permissions at creation time, so after a permissions change (e.g. approving `checks:write`) a
+	// cached token is stale and must be re-minted to pick up the new scope.
+	forceRefresh = false,
 ): Promise<string> {
 	if (!env.GITHUB_APP_PRIVATE_KEY) {
 		throw new Error("Missing GITHUB_APP_PRIVATE_KEY");
@@ -24,14 +28,14 @@ export async function getInstallationToken(
 	const now = Math.floor(Date.now() / 1000);
 	const kvKey = `installation-token:${installationId}`;
 
-	// Check in-memory cache first
-	const memCached = tokenCache.get(installationId);
+	// Check in-memory cache first (skipped on a forced refresh)
+	const memCached = forceRefresh ? undefined : tokenCache.get(installationId);
 	if (memCached && memCached.expiresAt - now > 300) {
 		return memCached.token;
 	}
 
-	// Check KV cache (shared across all isolates)
-	if (kv) {
+	// Check KV cache (shared across all isolates; skipped on a forced refresh)
+	if (kv && !forceRefresh) {
 		try {
 			const kvVal = await kv.get(kvKey, "json") as CachedToken | null;
 			if (kvVal && kvVal.expiresAt - now > 300) {
@@ -76,6 +80,32 @@ export async function getInstallationToken(
 	}
 
 	return data.token;
+}
+
+// Resolves the installation id for a repo using an App JWT. The webhook path reads the installation id
+// straight from the event payload, but the breakdown page (a plain GET with no webhook payload) has to
+// look it up so it can mint a token and aggregate.
+export async function getInstallationId(
+	env: Pick<AppEnv, "GITHUB_APP_ID" | "GITHUB_APP_PRIVATE_KEY">,
+	owner: string,
+	repo: string,
+): Promise<number> {
+	const jwt = await generateJwt(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY);
+
+	const res = await fetchWithRetry(`https://api.github.com/repos/${owner}/${repo}/installation`, {
+		headers: {
+			Authorization: `Bearer ${jwt}`,
+			Accept: "application/vnd.github+json",
+			"User-Agent": "required-builds-manager",
+		},
+	});
+
+	if (!res.ok) {
+		throw new Error(`Failed to get installation id: ${res.status} ${res.statusText}`);
+	}
+
+	const data: { id: number } = await res.json();
+	return data.id;
 }
 
 export async function generateJwt(appId: string, privateKeyPem: string): Promise<string> {

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { fetchMock } from "cloudflare:test";
-import { generateJwt, getInstallationToken, tokenCache } from "../src/auth";
+import { generateJwt, getInstallationToken, getInstallationId, tokenCache } from "../src/auth";
 
 const TEST_PRIVATE_KEY = `-----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCtHggT701TddZa
@@ -122,6 +122,26 @@ describe("getInstallationToken", () => {
 		expect(token).toBe("ghs_fresh");
 	});
 
+	it("forceRefresh skips a valid cached token and mints a fresh one", async () => {
+		// A token minted before a permissions change is stale (GitHub bakes permissions in at mint
+		// time), so callers can force a brand-new token even when the cache looks valid.
+		tokenCache.set(12345, {
+			token: "ghs_stale_cached",
+			expiresAt: Math.floor(Date.now() / 1000) + 3600,
+		});
+
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: "/app/installations/12345/access_tokens", method: "POST" })
+			.reply(200, JSON.stringify({
+				token: "ghs_forced_fresh",
+				expires_at: new Date(Date.now() + 3600000).toISOString(),
+			}), { headers: { "content-type": "application/json" } });
+
+		const token = await getInstallationToken(env, 12345, undefined, true);
+		expect(token).toBe("ghs_forced_fresh");
+	});
+
 	it("throws on missing private key", async () => {
 		const badEnv = { GITHUB_APP_ID: "12345", GITHUB_APP_PRIVATE_KEY: "" };
 		await expect(getInstallationToken(badEnv, 12345)).rejects.toThrow("Missing GITHUB_APP_PRIVATE_KEY");
@@ -134,5 +154,37 @@ describe("getInstallationToken", () => {
 			.reply(404, "Not Found");
 
 		await expect(getInstallationToken(env, 99999)).rejects.toThrow("Failed to get installation token: 404");
+	});
+});
+
+describe("getInstallationId", () => {
+	const env = { GITHUB_APP_ID: "12345", GITHUB_APP_PRIVATE_KEY: TEST_PRIVATE_KEY };
+
+	beforeEach(() => {
+		fetchMock.activate();
+		fetchMock.disableNetConnect();
+	});
+
+	afterEach(() => {
+		fetchMock.deactivate();
+	});
+
+	it("resolves the installation id for a repo", async () => {
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: "/repos/o/r/installation", method: "GET" })
+			.reply(200, JSON.stringify({ id: 424242 }), { headers: { "content-type": "application/json" } });
+
+		const id = await getInstallationId(env, "o", "r");
+		expect(id).toBe(424242);
+	});
+
+	it("throws on API error", async () => {
+		fetchMock
+			.get("https://api.github.com")
+			.intercept({ path: "/repos/o/missing/installation", method: "GET" })
+			.reply(404, "Not Found");
+
+		await expect(getInstallationId(env, "o", "missing")).rejects.toThrow("Failed to get installation id: 404");
 	});
 });
