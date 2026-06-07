@@ -312,26 +312,11 @@ export async function computeAllBuildsState(
 		}
 	}
 
-	// Enrich each failed or in-progress Actions check run with its individual steps, so the breakdown
-	// shows exactly which step failed or is running — not just that the job is red/yellow. Best-effort
-	// and only for non-passed check runs (passed jobs collapse to a single line), so the extra API
-	// calls are few; any fetch failure just omits the steps for that job.
-	await Promise.all(
-		entries.map(async (e) => {
-			if (e.kind !== "check" || e.state === "success") return;
-			const jobId = extractJobId(e.url);
-			if (jobId == null) return;
-			try {
-				const job = await getWorkflowJob(token, owner, repo, jobId);
-				const steps = job?.steps
-					?.filter((s) => s.name)
-					.map((s) => ({ name: s.name, state: mapStepState(s.status, s.conclusion) }));
-				if (steps && steps.length) e.steps = steps;
-			} catch {
-				// Best-effort — leave this job without a step breakdown.
-			}
-		}),
-	);
+	// NOTE: per-step detail (which step of a job failed / is running) is intentionally NOT fetched
+	// here. It costs one getWorkflowJob call per failed/in-progress Actions check run and is consumed
+	// only by the self-hosted breakdown page — the published commit status needs just state + title.
+	// Fetching it on every webhook would spend an API call per job on data the hot path discards, so
+	// it is deferred to enrichWithSteps(), called only when the breakdown page is rendered.
 
 	// Compute low-water-mark.
 	const failed = entries.filter((e) => e.state === "failure");
@@ -368,4 +353,42 @@ export async function computeAllBuildsState(
 		passed,
 		startedAt: earliestStart(entries),
 	};
+}
+
+// Fetches and attaches the individual job steps for a result's failed / in-progress check-run entries,
+// so the breakdown page can show exactly which step failed or is running (passed jobs collapse to a
+// single line and are left alone). Mutates the entries in place.
+//
+// This is deliberately separate from computeAllBuildsState and called ONLY by the breakdown page
+// (GET /b/...), never on the webhook path. It makes one getWorkflowJob call per non-passed Actions
+// check run, and the published commit status needs only state + title — so doing it on every webhook
+// would burn an API call per job on data the publish path throws away. The breakdown page is
+// human-triggered and rare, so that per-job cost lands only when someone actually views the detail.
+//
+// Best-effort: a non-Actions check run (no job id in its URL) or any fetch failure simply leaves that
+// entry without steps. Requires `actions:read`.
+export async function enrichWithSteps(
+	token: string,
+	owner: string,
+	repo: string,
+	result: AggregateResult,
+): Promise<void> {
+	// Only failed and in-progress check runs carry step detail; passed builds collapse to one line.
+	const candidates = [...result.failed, ...result.pending];
+	await Promise.all(
+		candidates.map(async (e) => {
+			if (e.kind !== "check") return;
+			const jobId = extractJobId(e.url);
+			if (jobId == null) return;
+			try {
+				const job = await getWorkflowJob(token, owner, repo, jobId);
+				const steps = job?.steps
+					?.filter((s) => s.name)
+					.map((s) => ({ name: s.name, state: mapStepState(s.status, s.conclusion) }));
+				if (steps && steps.length) e.steps = steps;
+			} catch {
+				// Best-effort — leave this job without a step breakdown.
+			}
+		}),
+	);
 }
