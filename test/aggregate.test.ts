@@ -136,11 +136,12 @@ describe("computeAllBuildsState", () => {
 		expect(result.title).toBe("1/1 builds passed");
 	});
 
-	it("no other statuses or check runs — success incoming", async () => {
+	it("a bare success incoming with an empty listing is pending, not a premature success", async () => {
 		const result = await computeAllBuildsState("token", "owner", "repo", "abc123", "success", "ci");
 
-		expect(result.state).toBe("success");
-		expect(result.title).toBe("1/1 builds passed");
+		expect(result.state).toBe("pending");
+		expect(result.title).toBe("No builds reported yet");
+		expect(result.passed).toHaveLength(0);
 	});
 
 	it("a bare pending incoming with an empty listing is pending, not a premature success", async () => {

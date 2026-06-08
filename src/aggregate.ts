@@ -272,10 +272,16 @@ export async function computeAllBuildsState(
 		}
 	}
 
-	// Fold in the triggering build, but NEVER when it's pending. The deduped listing above is
-	// authoritative for the current state of every status and check run; a pending incoming event
-	// adds nothing it doesn't already show, and trusting one can wedge all-builds on "in progress"
-	// while every real build is green:
+	const listingHadBuilds =
+		statuses.some((s) => s.context !== contextName) ||
+		checkRuns.some((cr) => !(appId != null && cr.app?.id === appId)) ||
+		workflowRuns.length > 0;
+
+	// Fold in the triggering build, but NEVER when it's pending, and never let a lone incoming
+	// success invent the first relevant build. The deduped listing above is authoritative for the
+	// current state of every status and check run; a pending incoming event adds nothing it doesn't
+	// already show, and trusting one can wedge all-builds on "in progress" while every real build is
+	// green:
 	//
 	//   * Workflow runs have no standalone row unless they FAIL — a passing or in-progress workflow
 	//     is represented by its own check runs (see the workflow loop above, which only adds
@@ -287,11 +293,13 @@ export async function computeAllBuildsState(
 	//     nothing re-aggregates to undo it.
 	//
 	// A failure incoming is still folded (the one case that matters under list-endpoint lag — notably
-	// a workflow `startup_failure` that has no check run yet), and a success incoming is still folded
-	// (harmless: it can only ever add/keep a passed row for the build that just reported, never raise
-	// or wedge anything). Only pending is dropped.
+	// a workflow `startup_failure` that has no check run yet). A success incoming is folded only after
+	// the listing has reported at least one non-self build signal; otherwise an empty commit can go
+	// green just because the combined status beat the real build rows into GitHub's list APIs.
 	const incomingSimple = toSimple(incomingState);
-	if (incomingSimple !== "pending" && !incomingIsIgnored && incomingContext !== contextName) {
+	const canFoldIncoming =
+		incomingSimple === "failure" || (incomingSimple === "success" && listingHadBuilds);
+	if (canFoldIncoming && !incomingIsIgnored && incomingContext !== contextName) {
 		const existing = entries.find(
 			(e) => e.name === incomingContext && (incoming?.kind === undefined || e.kind === incoming.kind),
 		);
@@ -334,14 +342,10 @@ export async function computeAllBuildsState(
 		// success there marks the combined result green before a single build has run. So fail CLOSED:
 		// an empty aggregate is pending.
 		//
-		// The one exception is when builds DID report but were all excluded by ignore patterns (or the
-		// triggering event itself is ignored): then there is genuinely nothing relevant to wait for and
-		// success is correct. We only reach this branch from a real webhook, so "nothing in the listing
-		// and the trigger wasn't ignored" means a real build is in flight but hasn't registered yet.
-		const listingHadBuilds =
-			statuses.some((s) => s.context !== contextName) ||
-			checkRuns.some((cr) => !(appId != null && cr.app?.id === appId)) ||
-			workflowRuns.length > 0;
+		// The one exception is when builds DID report but were all excluded by ignore patterns, or the
+		// triggering event itself is ignored: then there is genuinely nothing relevant to wait for and
+		// success is correct. A non-ignored incoming success does NOT qualify for this exception until
+		// some build signal has appeared in the listing.
 		state = listingHadBuilds || incomingIsIgnored ? "success" : "pending";
 	}
 
