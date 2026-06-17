@@ -872,4 +872,52 @@ describe("computeAllBuildsState", () => {
 			expect(result.failed[0].steps).toBeUndefined();
 		});
 	});
+
+	// The transient-green race that caused PazerOP/scratch#117. computeAllBuildsState's low-water-mark
+	// can only see builds that have ALREADY registered a status/check-run/workflow-run; it has no roster
+	// of EXPECTED builds, so an all-green SUBSET (the stragglers' check runs not created yet) legitimately
+	// computes `success`. These tests PIN that boundary on purpose:
+	//   - The aggregate alone cannot tell "all builds passed" from "the builds that registered so far
+	//     passed". Do NOT try to make it return pending here -- without an expected-build roster it can't,
+	//     and a wrong "guess" would either over-block forever (stale roster) or still miss #117.
+	//   - The actual guard against a transient green being consumed by auto-merge lives in the
+	//     CheckRunPublisher Durable Object's green-settle window (success is held as pending until it
+	//     stays green for a grace period). See test/check-run-publisher.test.ts.
+	// Once the stragglers DO register, the low-water-mark does its job: a single failure flips the
+	// aggregate to failure, which publishes immediately (never held).
+	describe("partial registration (the #117 transient-green boundary)", () => {
+		it("an all-green subset computes success at the aggregate level (the DO settle window is the guard)", async () => {
+			// Only 4 of the eventual 6 builds have registered, and all 4 are green. The aggregate cannot
+			// know 2 more are coming, so it returns success -- which is why publishing must defer it.
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "success" },
+				{ name: "test", status: "completed", conclusion: "success" },
+				{ name: "lint", status: "completed", conclusion: "success" },
+				{ name: "typecheck", status: "completed", conclusion: "success" },
+			]);
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "ecb2482", "success", "build");
+
+			expect(result.state).toBe("success");
+			expect(result.title).toBe("4/4 builds passed");
+		});
+
+		it("once the outstanding builds register with a failure, the aggregate flips to failure", async () => {
+			// The same commit a moment later: the 2 stragglers have registered and one failed. The
+			// low-water-mark now reports failure -- and a failure is published immediately, not held.
+			mockedListCheckRuns.mockResolvedValue([
+				{ name: "build", status: "completed", conclusion: "success" },
+				{ name: "test", status: "completed", conclusion: "success" },
+				{ name: "lint", status: "completed", conclusion: "success" },
+				{ name: "typecheck", status: "completed", conclusion: "success" },
+				{ name: "e2e", status: "completed", conclusion: "success" },
+				{ name: "integration", status: "completed", conclusion: "failure" },
+			]);
+
+			const result = await computeAllBuildsState("token", "owner", "repo", "ecb2482", "success", "integration");
+
+			expect(result.state).toBe("failure");
+			expect(result.title).toBe("1/6 builds failed");
+		});
+	});
 });

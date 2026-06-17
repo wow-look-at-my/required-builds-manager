@@ -248,6 +248,7 @@ describe("worker fetch handler", () => {
 			12345,
 			12345,
 			[],
+			expect.any(Array),
 			expect.objectContaining({ actualBuilds: expect.any(Array), actualState: expect.any(String) }),
 		);
 		// The webhook path publishes state + title only; it must NOT pay for per-step enrichment.
@@ -293,6 +294,7 @@ describe("worker fetch handler", () => {
 			12345,
 			12345,
 			[],
+			expect.any(Array),
 			expect.objectContaining({ actualBuilds: expect.any(Array), actualState: expect.any(String) }),
 		);
 	});
@@ -316,6 +318,7 @@ describe("worker fetch handler", () => {
 			12345,
 			12345,
 			[],
+			expect.any(Array),
 			expect.objectContaining({ actualBuilds: expect.any(Array), actualState: expect.any(String) }),
 		);
 	});
@@ -587,6 +590,7 @@ describe("worker fetch handler", () => {
 			12345,
 			12345,
 			[],
+			expect.any(Array),
 			expect.objectContaining({ actualBuilds: expect.any(Array), actualState: expect.any(String) }),
 		);
 	});

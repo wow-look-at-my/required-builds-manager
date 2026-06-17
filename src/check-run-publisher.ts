@@ -12,6 +12,10 @@ interface PublisherEnv {
 	GITHUB_APP_PRIVATE_KEY: string;
 	TOKEN_CACHE?: KVNamespace;
 	STATS_RECORDER?: DurableObjectNamespace<StatsRecorder>;
+	// How long a computed `success` must hold steady before it is actually published (the green-settle
+	// window, in milliseconds). Optional string env var (Cloudflare vars/secrets are strings); unset or
+	// invalid -> DEFAULT_GREEN_SETTLE_MS. See applyGreenSettle.
+	GREEN_SETTLE_MS?: string;
 }
 
 // Everything the per-commit comparison needs: the triggering build reduced to a single state (null when
@@ -54,6 +58,22 @@ interface PendingPublish {
 	installationId: number;
 	appId: number;
 	ignore: string[];
+	// The roster of build identities ("kind:name") backing `update`, so the trailing flush can feed the
+	// green-settle window the same "did a new build appear?" signal a leading-edge publish would.
+	roster: string[];
+}
+
+// An open green-settle window: we have seen the aggregate go `success`, but are holding it as `pending`
+// until it stays green, with an unchanged roster, for the full window (see applyGreenSettle). Persisted
+// in DO storage only while a green is awaiting confirmation; deleted the moment the aggregate is no
+// longer green or the green is confirmed.
+interface GreenSettle {
+	// When the current stable-green window started. NOT reset by repeat green events for the same
+	// roster, so it measures real wall-clock since the first green -- only a roster change restarts it.
+	since: number;
+	// The sorted roster of build identities ("kind:name") observed when the window (re)started. A later
+	// re-aggregation showing a different/larger roster means a new build registered -> restart the clock.
+	roster: string[];
 }
 
 const RECONCILE_KEY = "reconcile";
@@ -82,8 +102,29 @@ const RECONCILE_MAX_MS = 300_000;
 // anything still pending is a genuinely stuck external check, not a dropped event we can heal.
 const RECONCILE_MAX_ATTEMPTS = 12;
 
+// DO storage key for the open green-settle window (see GreenSettle / applyGreenSettle).
+const GREEN_SETTLE_KEY = "greenSettle";
+// How long a computed `success` must stay green (with an unchanged roster) before we publish it. The
+// only state auto-merge can irreversibly consume is `success`, so we deliberately add latency ONLY to
+// the green transition -- failure/pending stay instant. 45s is long enough for stragglers (a build that
+// fired its workflow webhook but hasn't registered its check run yet) to show up, and trivial against
+// CI wall-clock. Override via env GREEN_SETTLE_MS.
+const DEFAULT_GREEN_SETTLE_MS = 45_000;
+
 function backoffMs(attempts: number): number {
 	return Math.min(RECONCILE_BASE_MS * 2 ** attempts, RECONCILE_MAX_MS);
+}
+
+function greenSettleMs(env: PublisherEnv): number {
+	const n = env.GREEN_SETTLE_MS ? parseInt(env.GREEN_SETTLE_MS, 10) : NaN;
+	return Number.isFinite(n) && n >= 0 ? n : DEFAULT_GREEN_SETTLE_MS;
+}
+
+// Equality of two ALREADY-SORTED roster arrays.
+function keysEqual(a: string[], b: string[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
 }
 
 // Durable Object that serializes commit-status publishing per commit AND self-heals stuck results.
@@ -120,6 +161,18 @@ function backoffMs(attempts: number): number {
 //    merge gate); events within PUBLISH_DEBOUNCE_MS are stashed and a single trailing flush (driven by
 //    the same alarm) publishes the latest. dedup still runs at flush time, so a coalesced burst that
 //    nets out to no change posts nothing at all.
+//
+// 5. Green-settle window: a computed `success` is NEVER published the instant it appears. GitHub native
+//    auto-merge consumes a required status the moment it goes green, and that merge is irreversible -- so
+//    a TRANSIENT green (an all-green SUBSET of the builds, before the stragglers have registered their
+//    check runs) gets merged even though CI ultimately fails (the PazerOP/scratch#117 incident). The
+//    aggregate's low-water-mark can only see builds that have already registered, so a partial all-green
+//    listing legitimately computes `success`. To make a transient green unmergeable, `success` is HELD:
+//    we publish `pending` instead and arm the (existing) reconcile alarm for a grace window; only after
+//    the aggregate has stayed green, with an UNCHANGED roster, for the whole window does the alarm
+//    promote it to `success`. failure/pending/error are unaffected -- they publish immediately (they are
+//    responsive and can never cause a bad merge). This adds at most ~GREEN_SETTLE_MS of latency to the
+//    green->merge path, which is negligible against CI wall-clock. (See applyGreenSettle.)
 export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 	async publish(
 		token: string,
@@ -131,6 +184,7 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 		appId: number | undefined,
 		installationId: number,
 		ignore: string[],
+		roster: string[] = [],
 		measure?: MeasurePayload,
 	): Promise<void> {
 		await this.ctx.blockConcurrencyWhile(async () => {
@@ -151,7 +205,7 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 				// Leading edge: the window is open, so publish immediately (keeps the merge gate
 				// responsive). Any queued trailing flush is superseded by this fresher publish.
 				await this.ctx.storage.delete(PENDING_PUBLISH_KEY);
-				await this.doPublish(token, owner, repo, sha, context, update, appId, installationId, ignore);
+				await this.doPublish(token, owner, repo, sha, context, update, appId, installationId, ignore, roster);
 				// Mark the window only AFTER a successful publish, so a thrown publish (e.g. a 403 the
 				// handler retries with a fresh token) re-enters the leading edge instead of being deferred.
 				await this.ctx.storage.put<number>(LAST_FLUSH_AT_KEY, Date.now());
@@ -168,6 +222,7 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 					installationId,
 					appId: appId ?? 0,
 					ignore,
+					roster,
 				});
 				const flushAt = lastFlushAt + PUBLISH_DEBOUNCE_MS;
 				const existing = await this.ctx.storage.getAlarm();
@@ -178,9 +233,12 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 		});
 	}
 
-	// Publishes one status and maintains the self-heal alarm. Arms the reconcile alarm BEFORE publishing
-	// so a failed publish -- pending OR terminal -- is retried by the alarm; clears it only once a
-	// terminal publish has actually landed. Shared by the leading-edge path and the trailing flush.
+	// Publishes one status and maintains the self-heal alarm. Routes the desired update through the
+	// green-settle gate first (a computed `success` is held as `pending` until confirmed -- see
+	// applyGreenSettle), then arms the reconcile alarm BEFORE publishing so a failed publish -- pending,
+	// held-green, OR terminal -- is retried by the alarm; clears it only once a TERMINAL publish
+	// (failure/error, or a CONFIRMED success) has actually landed. Shared by the leading-edge path and
+	// the trailing flush. `roster` is the build identities backing `update`, fed to the settle window.
 	private async doPublish(
 		token: string,
 		owner: string,
@@ -191,23 +249,76 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 		appId: number | undefined,
 		installationId: number,
 		ignore: string[],
+		roster: string[],
 	): Promise<void> {
-		await this.armReconcile({
-			owner,
-			repo,
-			sha,
-			installationId,
-			appId: appId ?? 0,
-			context,
-			ignore,
-			targetUrl: update.targetUrl,
-		});
-		await this.publishIfChanged(token, owner, repo, sha, context, update);
-		if (update.state !== "pending") {
+		const decided = await this.applyGreenSettle(update, roster, Date.now(), greenSettleMs(this.env));
+
+		await this.armReconcile(
+			{
+				owner,
+				repo,
+				sha,
+				installationId,
+				appId: appId ?? 0,
+				context,
+				ignore,
+				targetUrl: update.targetUrl,
+			},
+			// When holding green, re-check at the window deadline (so success is confirmed promptly);
+			// otherwise fall back to the normal reconcile base delay.
+			decided.armAt ?? undefined,
+		);
+		await this.publishIfChanged(token, owner, repo, sha, context, decided.update);
+		if (decided.terminal) {
 			// Terminal landed -- stop reconciling. (If publishIfChanged threw, we never reach here and the
 			// armed alarm retries.)
 			await this.clearReconcile();
 		}
+	}
+
+	// The green-only settle gate. Given a freshly-computed `update` and the roster of build identities
+	// backing it, returns the update we should ACTUALLY publish, whether it is terminal (so the caller
+	// can clear the reconcile alarm), and -- when holding green -- the absolute time to re-check.
+	//
+	// failure / pending / error pass through unchanged and clear any open window (failure/error are
+	// terminal; pending is not). A `success` is HELD: we publish `pending` in its place and (re)open the
+	// window, UNLESS the aggregate has already been green with this exact roster for the full window --
+	// then the green is confirmed and `success` passes through as terminal. A roster that GREW while we
+	// waited (a new build registered) restarts the clock: more builds may still be coming, which is
+	// precisely the transient-green race we are guarding against.
+	private async applyGreenSettle(
+		update: StatusUpdate,
+		roster: string[],
+		now: number,
+		settleMs: number,
+	): Promise<{ update: StatusUpdate; terminal: boolean; armAt: number | null }> {
+		if (update.state !== "success") {
+			// Not green -> nothing to settle. Drop any open window.
+			await this.ctx.storage.delete(GREEN_SETTLE_KEY);
+			return { update, terminal: update.state !== "pending", armAt: null };
+		}
+
+		const key = [...roster].sort();
+		const prev = await this.ctx.storage.get<GreenSettle>(GREEN_SETTLE_KEY);
+		const rosterUnchanged = prev != null && keysEqual(prev.roster, key);
+
+		if (prev != null && rosterUnchanged && now - prev.since >= settleMs) {
+			// Confirmed: stably green, no new build, for the whole window. Promote to success.
+			await this.ctx.storage.delete(GREEN_SETTLE_KEY);
+			return { update, terminal: true, armAt: null };
+		}
+
+		// Open the window (first green) or extend it (roster grew -> restart the clock). Publish pending
+		// in place of the premature green and re-check at the (possibly new) deadline. We keep the
+		// success description ("N/N builds passed"): with the pending state it reads as "all registered
+		// builds passed, finalizing", and the pending STATE is the load-bearing signal for the merge gate.
+		const since = rosterUnchanged ? prev!.since : now;
+		await this.ctx.storage.put<GreenSettle>(GREEN_SETTLE_KEY, { since, roster: key });
+		return {
+			update: { state: "pending", description: update.description, targetUrl: update.targetUrl },
+			terminal: false,
+			armAt: since + settleMs,
+		};
 	}
 
 	// Two jobs, in priority order: (1) flush a debounced publish whose window has elapsed, then (2) the
@@ -232,6 +343,7 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 							pending.appId || undefined,
 							pending.installationId,
 							pending.ignore,
+							pending.roster,
 						);
 					};
 					try {
@@ -271,16 +383,23 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 					s.appId || undefined,
 					{ context: s.context, ignore: s.ignore },
 				);
-				// Skip the POST if the re-aggregated status matches what we last published -- the alarm is
-				// a safety net for a MISSED transition, not a reason to re-emit an identical (still
-				// pending) status every backoff interval. Safe because we only record after a successful
-				// POST, so an equal record means GitHub provably already has this status.
-				await this.publishIfChanged(token, s.owner, s.repo, s.sha, s.context, {
-					state: result.state,
-					description: result.title,
-					targetUrl: s.targetUrl,
-				});
-				return result.state === "pending" ? "pending" : "resolved";
+				const roster = [...result.failed, ...result.pending, ...result.passed].map((e) => `${e.kind}:${e.name}`);
+				// Re-aggregation goes through the SAME green-settle gate, so the alarm can never publish an
+				// unconfirmed success: it confirms a stably-green roster, holds a fresh/grown green as
+				// pending, or publishes the failure/pending it found. This is also where a green FIRST
+				// observed on a leading edge gets confirmed once the window elapses.
+				const decided = await this.applyGreenSettle(
+					{ state: result.state, description: result.title, targetUrl: s.targetUrl },
+					roster,
+					Date.now(),
+					greenSettleMs(this.env),
+				);
+				// Skip the POST if the decided status matches what we last published -- the alarm is a
+				// safety net for a MISSED transition, not a reason to re-emit an identical (still pending)
+				// status every backoff interval. Safe because we only record after a successful POST, so an
+				// equal record means GitHub provably already has this status.
+				await this.publishIfChanged(token, s.owner, s.repo, s.sha, s.context, decided.update);
+				return decided.terminal ? "resolved" : "pending";
 			};
 
 			try {
@@ -300,6 +419,20 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 					await this.ctx.storage.delete(RECONCILE_KEY);
 					return;
 				}
+				// attempt SUCCEEDED but the result isn't terminal. If a green-settle window is open (the
+				// re-aggregation held a success as pending), the next check is the window deadline -- a
+				// definite confirmation time, not a self-heal retry, so it must NOT count against the
+				// backoff cap (a long window could otherwise exhaust the attempts before the green is ever
+				// confirmed). A roster that grew moved `since` forward, so the deadline follows it. This is
+				// only safe on a successful attempt: a thrown attempt must use the capped backoff below, or
+				// a persistent error during a held green would hammer GitHub on a ~1s loop.
+				const settle = await this.ctx.storage.get<GreenSettle>(GREEN_SETTLE_KEY);
+				if (settle) {
+					await this.ctx.storage.put<ReconcileState>(RECONCILE_KEY, { ...s, attempts: 0 });
+					await this.ctx.storage.setAlarm(Math.max(settle.since + greenSettleMs(this.env), Date.now() + 1000));
+					return;
+				}
+				// Otherwise a plain pending -- fall through to the capped self-heal backoff.
 			} catch (err) {
 				// A 403 that survives a forced token refresh is a real, unfixable permission problem (the
 				// installation genuinely lacks `statuses:write`) -- stop rather than hammer GitHub.
@@ -307,7 +440,7 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 					await this.ctx.storage.delete(RECONCILE_KEY);
 					return;
 				}
-				// Otherwise transient -- fall through to re-arm and try again.
+				// Otherwise transient -- fall through to the capped backoff re-arm and try again.
 			}
 
 			const attempts = s.attempts + 1;
@@ -385,10 +518,12 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 		await this.ctx.storage.put<PredBuild[]>(EVENTSTORE_KEY, m.actualBuilds);
 	}
 
-	private async armReconcile(s: Omit<ReconcileState, "attempts">): Promise<void> {
-		// Reset attempts on every real event -- progress is happening, so restart the backoff clock.
+	// Arms the self-heal/settle alarm. Resets attempts (a real publish just happened -- progress, so
+	// restart the backoff clock). `armAt` overrides the fire time (the green-settle window passes its
+	// deadline); otherwise the normal reconcile base delay.
+	private async armReconcile(s: Omit<ReconcileState, "attempts">, armAt?: number): Promise<void> {
 		await this.ctx.storage.put<ReconcileState>(RECONCILE_KEY, { ...s, attempts: 0 });
-		await this.ctx.storage.setAlarm(Date.now() + RECONCILE_BASE_MS);
+		await this.ctx.storage.setAlarm(armAt ?? Date.now() + RECONCILE_BASE_MS);
 	}
 
 	private async clearReconcile(): Promise<void> {
@@ -410,9 +545,10 @@ export async function publishViaCoordinator(
 	appId: number | undefined,
 	installationId: number,
 	ignore: string[],
+	roster: string[] = [],
 	measure?: MeasurePayload,
 ): Promise<void> {
 	const id = namespace.idFromName(`${owner}/${repo}@${sha}`);
 	const stub = namespace.get(id);
-	await stub.publish(token, owner, repo, sha, context, update, appId, installationId, ignore, measure);
+	await stub.publish(token, owner, repo, sha, context, update, appId, installationId, ignore, roster, measure);
 }
