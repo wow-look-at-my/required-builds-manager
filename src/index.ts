@@ -307,6 +307,12 @@ export default {
 			isPrivate,
 		};
 
+		// The roster of build identities ("kind:name") behind this aggregate. The DO's green-settle
+		// window uses it to distinguish a stable all-green from one where new builds are still
+		// registering -- so a transient green (an all-green subset, before the stragglers' check runs
+		// exist) is held as pending instead of being published and irreversibly consumed by auto-merge.
+		const roster = [...result.failed, ...result.pending, ...result.passed].map((e) => `${e.kind}:${e.name}`);
+
 		// Route through the per-commit Durable Object so simultaneous build events serialize (last to
 		// arrive wins, no interleaved stale publish) and the self-heal alarm can re-publish if a
 		// terminal event is missed. installationId + ignore patterns + target_url are carried so the
@@ -323,6 +329,7 @@ export default {
 				appId,
 				installationId,
 				config.ignore,
+				roster,
 				measure,
 			);
 

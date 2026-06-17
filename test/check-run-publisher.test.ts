@@ -34,18 +34,22 @@ describe("publishViaCoordinator (Durable Object)", () => {
 	const targetUrl = "https://w.example/b/o/r/sha?k=sig";
 
 	it("publishes a commit status through the DO", async () => {
+		// A failure is a clean immediate publish (the green-settle hold applies only to success), so it's
+		// the simplest smoke test that the DO POSTs a status.
 		fetchMock
 			.get("https://api.github.com")
 			.intercept({ path: "/repos/o/r/statuses/do-sha-1", method: "POST" })
 			.reply(201, { id: 1 });
 
-		await publishViaCoordinator(ns(), "token", "o", "r", "do-sha-1", "all-builds", { state: "success", description: "All builds passed", targetUrl }, 99999, 12345, []);
+		await publishViaCoordinator(ns(), "token", "o", "r", "do-sha-1", "all-builds", { state: "failure", description: "1/2 builds failed", targetUrl }, 99999, 12345, []);
 	});
 
 	it("serializes concurrent publishes for one commit (leading posts, the rest flush)", async () => {
 		// blockConcurrencyWhile runs the two events one-at-a-time so an earlier-aggregated state can't
 		// land after a later one. With the throttle, the first (leading edge) posts immediately and the
-		// second is coalesced into the trailing flush -- both states reach GitHub (one sync, one flushed).
+		// second is coalesced into the trailing flush -- so two POSTs happen. (The second event's success
+		// is held by the green-settle window, so it posts as pending, not success -- but it still posts,
+		// which is what this test cares about: serialization + flush, last-to-arrive wins.)
 		fetchMock
 			.get("https://api.github.com")
 			.intercept({ path: "/repos/o/r/statuses/do-sha-3", method: "POST" })
@@ -91,12 +95,13 @@ describe("publishViaCoordinator (Durable Object)", () => {
 
 		const namespace = ns();
 		// Leading-edge pending publish arms the reconcile alarm...
-		await publishViaCoordinator(namespace, "token", "o", "r", "clear-sha", "all-builds", { state: "pending", description: "0/1 builds passed", targetUrl }, 99999, 12345, []);
-		// ...the terminal success lands in the debounce window, so it's flushed by the alarm.
-		await publishViaCoordinator(namespace, "token", "o", "r", "clear-sha", "all-builds", { state: "success", description: "1/1 builds passed", targetUrl }, 99999, 12345, []);
+		await publishViaCoordinator(namespace, "token", "o", "r", "clear-sha", "all-builds", { state: "pending", description: "0/2 builds passed", targetUrl }, 99999, 12345, []);
+		// ...a terminal FAILURE lands in the debounce window, so it's flushed by the alarm. (Failure is
+		// an immediate terminal -- only success is held by the green-settle window -- so the alarm clears.)
+		await publishViaCoordinator(namespace, "token", "o", "r", "clear-sha", "all-builds", { state: "failure", description: "1/2 builds failed", targetUrl }, 99999, 12345, []);
 
 		const stub = namespace.get(namespace.idFromName("o/r@clear-sha"));
-		expect(await runDurableObjectAlarm(stub)).toBe(true); // trailing flush publishes the terminal success
+		expect(await runDurableObjectAlarm(stub)).toBe(true); // trailing flush publishes the terminal failure
 
 		const alarm = await runInDurableObject(stub, (_i, state) => state.storage.getAlarm());
 		expect(alarm).toBeNull();
@@ -119,8 +124,9 @@ describe("publishViaCoordinator (Durable Object)", () => {
 			.intercept({ path: "/repos/o/r/statuses/heal-sha", method: "POST" })
 			.reply(201, { id: 1 })
 			.times(2);
-		// The alarm re-aggregates: an empty status list, one real passing check run, no workflow runs
-		// -> success -> resolved.
+		// The alarm re-aggregates and finds a missed terminal FAILURE (a failing check run) -> resolved.
+		// (We use failure, not success, for the simplest self-heal: a success would be held by the
+		// green-settle window and need a second alarm to confirm -- that path is covered separately below.)
 		fetchMock
 			.get("https://api.github.com")
 			.intercept({ path: /^\/repos\/o\/r\/statuses\/heal-sha\?/, method: "GET" })
@@ -128,7 +134,7 @@ describe("publishViaCoordinator (Durable Object)", () => {
 		fetchMock
 			.get("https://api.github.com")
 			.intercept({ path: /^\/repos\/o\/r\/commits\/heal-sha\/check-runs/, method: "GET" })
-			.reply(200, { check_runs: [{ name: "build", status: "completed", conclusion: "success" }] });
+			.reply(200, { check_runs: [{ name: "build", status: "completed", conclusion: "failure" }] });
 		fetchMock
 			.get("https://api.github.com")
 			.intercept({ path: /^\/repos\/o\/r\/actions\/runs/, method: "GET" })
@@ -141,7 +147,7 @@ describe("publishViaCoordinator (Durable Object)", () => {
 		const ran = await runDurableObjectAlarm(stub);
 		expect(ran).toBe(true);
 
-		// The re-aggregation found everything green, so the status was published as terminal and the
+		// The re-aggregation found the terminal failure, so the status was published as terminal and the
 		// reconcile state was cleared -- no more alarms.
 		const reconcile = await runInDurableObject(stub, (_i, state) => state.storage.get("reconcile"));
 		expect(reconcile).toBeUndefined();
@@ -255,7 +261,8 @@ describe("publishViaCoordinator (Durable Object)", () => {
 
 	it("debounce: a burst coalesces to a single trailing flush of the latest state", async () => {
 		// Four events, two POSTs: leading edge posts 1/4, the next three collapse into one stash, and the
-		// single flush posts only the latest (4/4).
+		// single flush posts only the latest (4/4 -- held as pending by the green-settle window, but it's
+		// the coalesced-latest that's flushed, which is what this test checks).
 		fetchMock
 			.get("https://api.github.com")
 			.intercept({ path: "/repos/o/r/statuses/burst-sha", method: "POST" })
@@ -277,5 +284,196 @@ describe("publishViaCoordinator (Durable Object)", () => {
 		expect(pending?.update?.description).toBe("4/4 builds passed");
 
 		expect(await runDurableObjectAlarm(stub)).toBe(true); // single flush posts 4/4
+	});
+
+	// Green-settle window: a computed `success` is the only state GitHub native auto-merge can
+	// irreversibly consume, so it is never published on the leading edge. It is held as `pending` and
+	// only the reconcile alarm -- after the window has elapsed with an unchanged roster -- promotes it to
+	// `success`. This is the fix for the PazerOP/scratch#117 transient-green auto-merge. failure/pending
+	// are unaffected (they publish immediately). The window's wall-clock is faked here by backdating the
+	// stored `greenSettle.since` rather than waiting the real ~45s.
+	describe("green-settle window (transient-green guard)", () => {
+		it("holds a computed success as pending on the leading edge and arms the window", async () => {
+			let body: string | undefined;
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: "/repos/o/r/statuses/gs-hold", method: "POST" })
+				.reply((opts) => {
+					body = String(opts.body);
+					return { statusCode: 201, data: { id: 1 } };
+				});
+
+			const namespace = ns();
+			await publishViaCoordinator(
+				namespace, "token", "o", "r", "gs-hold", "all-builds",
+				{ state: "success", description: "3/3 builds passed", targetUrl }, 99999, 12345, [],
+				["check:build", "check:test", "check:lint"],
+			);
+
+			// The leading edge posted PENDING, not success -- a transient green must stay unmergeable.
+			expect(JSON.parse(body!).state).toBe("pending");
+
+			const stub = namespace.get(namespace.idFromName("o/r@gs-hold"));
+			// The window is open (roster stored sorted) and an alarm is armed to confirm it later.
+			const settle = await runInDurableObject(stub, (_i, state) => state.storage.get("greenSettle"));
+			expect(settle).toMatchObject({ roster: ["check:build", "check:lint", "check:test"] });
+			const alarm = await runInDurableObject(stub, (_i, state) => state.storage.getAlarm());
+			expect(alarm).not.toBeNull();
+		});
+
+		it("the alarm promotes a stable green to success once the window has elapsed", async () => {
+			const cache = (env as unknown as { TOKEN_CACHE: KVNamespace }).TOKEN_CACHE;
+			await cache.put(
+				"installation-token:12345",
+				JSON.stringify({ token: "cached-token", expiresAt: Math.floor(Date.now() / 1000) + 3600 }),
+			);
+
+			const bodies: string[] = [];
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: "/repos/o/r/statuses/gs-confirm", method: "POST" })
+				.reply((opts) => {
+					bodies.push(String(opts.body));
+					return { statusCode: 201, data: { id: 1 } };
+				})
+				.times(2);
+			// The alarm re-aggregates: empty status list, one passing check run "build", no workflow runs
+			// -> success with the SAME roster the window holds.
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /^\/repos\/o\/r\/statuses\/gs-confirm\?/, method: "GET" })
+				.reply(200, []);
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /^\/repos\/o\/r\/commits\/gs-confirm\/check-runs/, method: "GET" })
+				.reply(200, { check_runs: [{ name: "build", status: "completed", conclusion: "success" }] });
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /^\/repos\/o\/r\/actions\/runs/, method: "GET" })
+				.reply(200, { workflow_runs: [] });
+
+			const namespace = ns();
+			await publishViaCoordinator(
+				namespace, "token", "o", "r", "gs-confirm", "all-builds",
+				{ state: "success", description: "1/1 builds passed", targetUrl }, 99999, 12345, [], ["check:build"],
+			);
+
+			const stub = namespace.get(namespace.idFromName("o/r@gs-confirm"));
+			// Backdate the window so it has "elapsed" without waiting the real ~45s.
+			await runInDurableObject(stub, (_i, state) =>
+				state.storage.put("greenSettle", { since: Date.now() - 60_000, roster: ["check:build"] }),
+			);
+
+			expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+			// Leading edge held pending; the alarm confirmed and posted success.
+			expect(JSON.parse(bodies[0]).state).toBe("pending");
+			expect(JSON.parse(bodies[1]).state).toBe("success");
+			// Confirmed -> window closed, reconcile cleared, no more alarms.
+			const settle = await runInDurableObject(stub, (_i, state) => state.storage.get("greenSettle"));
+			expect(settle).toBeUndefined();
+			const reconcile = await runInDurableObject(stub, (_i, state) => state.storage.get("reconcile"));
+			expect(reconcile).toBeUndefined();
+		});
+
+		it("a new build registering during the window restarts it (stays pending, never confirms early)", async () => {
+			const cache = (env as unknown as { TOKEN_CACHE: KVNamespace }).TOKEN_CACHE;
+			await cache.put(
+				"installation-token:12345",
+				JSON.stringify({ token: "cached-token", expiresAt: Math.floor(Date.now() / 1000) + 3600 }),
+			);
+
+			const bodies: string[] = [];
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: "/repos/o/r/statuses/gs-grow", method: "POST" })
+				.reply((opts) => {
+					bodies.push(String(opts.body));
+					return { statusCode: 201, data: { id: 1 } };
+				})
+				.times(2);
+			// Even though the window has "elapsed", re-aggregation now finds a SECOND passing build that
+			// wasn't in the held roster -- a straggler just registered. The green is not yet trustworthy.
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /^\/repos\/o\/r\/statuses\/gs-grow\?/, method: "GET" })
+				.reply(200, []);
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /^\/repos\/o\/r\/commits\/gs-grow\/check-runs/, method: "GET" })
+				.reply(200, {
+					check_runs: [
+						{ name: "build", status: "completed", conclusion: "success" },
+						{ name: "test", status: "completed", conclusion: "success" },
+					],
+				});
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /^\/repos\/o\/r\/actions\/runs/, method: "GET" })
+				.reply(200, { workflow_runs: [] });
+
+			const namespace = ns();
+			await publishViaCoordinator(
+				namespace, "token", "o", "r", "gs-grow", "all-builds",
+				{ state: "success", description: "1/1 builds passed", targetUrl }, 99999, 12345, [], ["check:build"],
+			);
+
+			const stub = namespace.get(namespace.idFromName("o/r@gs-grow"));
+			// Backdate so the window would confirm IF the roster were stable -- it isn't.
+			await runInDurableObject(stub, (_i, state) =>
+				state.storage.put("greenSettle", { since: Date.now() - 60_000, roster: ["check:build"] }),
+			);
+
+			expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+			// Both posts were PENDING: the grown roster restarted the clock, so success is never confirmed
+			// early. The window now tracks the bigger roster and the alarm stays armed.
+			expect(JSON.parse(bodies[0]).state).toBe("pending");
+			expect(JSON.parse(bodies[1]).state).toBe("pending");
+			const settle = (await runInDurableObject(stub, (_i, state) => state.storage.get("greenSettle"))) as
+				| { since: number; roster: string[] }
+				| undefined;
+			expect(settle?.roster).toEqual(["check:build", "check:test"]);
+			expect(settle!.since).toBeGreaterThan(Date.now() - 5_000); // clock restarted to ~now
+			const reconcile = await runInDurableObject(stub, (_i, state) => state.storage.get("reconcile"));
+			expect(reconcile).toBeDefined();
+		});
+
+		it("failure and pending publish immediately and open no settle window", async () => {
+			let fbody: string | undefined;
+			let pbody: string | undefined;
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: "/repos/o/r/statuses/gs-fail", method: "POST" })
+				.reply((opts) => {
+					fbody = String(opts.body);
+					return { statusCode: 201, data: { id: 1 } };
+				});
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: "/repos/o/r/statuses/gs-pend", method: "POST" })
+				.reply((opts) => {
+					pbody = String(opts.body);
+					return { statusCode: 201, data: { id: 1 } };
+				});
+
+			const namespace = ns();
+			await publishViaCoordinator(
+				namespace, "token", "o", "r", "gs-fail", "all-builds",
+				{ state: "failure", description: "1/2 builds failed", targetUrl }, 99999, 12345, [], ["check:a", "check:b"],
+			);
+			await publishViaCoordinator(
+				namespace, "token", "o", "r", "gs-pend", "all-builds",
+				{ state: "pending", description: "0/2 builds passed", targetUrl }, 99999, 12345, [], ["check:a", "check:b"],
+			);
+
+			// Both published their true state on the leading edge -- only success is held.
+			expect(JSON.parse(fbody!).state).toBe("failure");
+			expect(JSON.parse(pbody!).state).toBe("pending");
+			const fstub = namespace.get(namespace.idFromName("o/r@gs-fail"));
+			const pstub = namespace.get(namespace.idFromName("o/r@gs-pend"));
+			expect(await runInDurableObject(fstub, (_i, state) => state.storage.get("greenSettle"))).toBeUndefined();
+			expect(await runInDurableObject(pstub, (_i, state) => state.storage.get("greenSettle"))).toBeUndefined();
+		});
 	});
 });
