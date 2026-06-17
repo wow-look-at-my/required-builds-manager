@@ -13,7 +13,7 @@ When any CI system reports a status, check run, or workflow run on a commit, thi
    - **failure** if any build failed
    - **pending** if any build is still running, or if builds have been triggered but none have reported yet (fail closed -- the combined check never goes green before CI has actually run)
    - **success** only if all reported builds passed
-5. Publishes the result as an "all-builds" **commit status**, whose "Details" link opens a worker-served breakdown page
+5. Publishes the result as an "all-builds" **commit status**, whose "Details" link opens a worker-served breakdown page — with one safeguard: a newly-computed **success is held briefly before it's published** (see [Holding a transient green](#holding-a-transient-green-auto-merge-safety) below)
 
 ### Detailed failure reporting
 
@@ -23,6 +23,12 @@ The commit status doesn't just say pass/fail:
 - Its **"Details" link** (`target_url`) opens a **worker-served breakdown page** listing every build grouped into **Failed / In progress / Passed**, where each build links to its own check and a failed or in-progress Actions job shows its individual steps (which step failed / is running). On a failure the passing builds are omitted, so the page stays focused on what broke. A `Total time` line (first build start → last build finish) is shown when builds report timing. The page shows build and step **state only — never logs**.
 
 Why a **commit status** rather than a check run? GitHub **freezes a check run once it's `completed`** — a later API call can't move it back to "in progress" — so a check run that went green (even prematurely, before every build had registered) stayed green and kept merge unblocked. A commit status has no such freeze: GitHub keeps the latest status per context and lets it move between success / pending / failure on every event, so `all-builds` can always correct itself (including dropping back to pending/failure if a new build appears for an already-green commit). The trade-off — a status `description` is capped at ~140 characters — is why the full breakdown is served as its own page rather than inline.
+
+#### Holding a transient green (auto-merge safety)
+
+A commit status that can move freely fixes a *stuck* premature green, but not a *transient* one. GitHub native auto-merge consumes a required check **the instant it goes green**, and that merge is irreversible — so a status that is green for even a second is enough to merge a PR whose CI ultimately fails. This happens because the aggregate's low-water-mark can only see the builds that have **already registered** a status/check-run/workflow-run: right after a push (especially an update-branch merge commit) a green *subset* can register before the builds that will fail have created their check runs, so the aggregate momentarily reads all-green.
+
+To make a transient green unmergeable, the worker **never publishes `success` on the first sight of it**. When the aggregate computes `success`, the combined status is held at **`pending`** and a short **settle window** (default 45s, configurable via `GREEN_SETTLE_MS`) is started. Only after the aggregate has stayed green — *with no new build registering* — for the whole window is `success` actually published. If a build registers during the window (the telltale sign more were still coming), the clock restarts; if anything fails, `failure` is published immediately. `failure` and `pending` are **never** delayed — only the `success` transition, the only one auto-merge can irreversibly act on. The cost is at most ~45s of extra latency before a green PR becomes mergeable, which is negligible against CI wall-clock.
 
 #### Breakdown page access (capability URL)
 
@@ -76,6 +82,12 @@ Set the following secrets on your Cloudflare Worker:
 | `GITHUB_APP_ID` | Your GitHub App's ID |
 | `GITHUB_APP_PRIVATE_KEY` | The App's PEM-encoded RSA private key (PKCS#1 or PKCS#8) |
 | `WEBHOOK_SECRET` | The webhook secret configured in your GitHub App |
+
+Optional, non-secret variables (set as plain Worker vars):
+
+| Variable | Default | Description |
+|---|---|---|
+| `GREEN_SETTLE_MS` | `45000` | How long (ms) a computed `success` must stay green, with an unchanged set of builds, before it is published. Guards against a transient green being consumed by auto-merge (see [Holding a transient green](#holding-a-transient-green-auto-merge-safety)). Only the `success` transition is delayed; `failure`/`pending` always publish immediately. |
 
 Point your GitHub App's webhook URL to your deployed Worker.
 
