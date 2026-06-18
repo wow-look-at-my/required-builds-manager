@@ -439,6 +439,121 @@ describe("publishViaCoordinator (Durable Object)", () => {
 			expect(reconcile).toBeDefined();
 		});
 
+		it("a roster that SHRINKS (list-endpoint lag) does not restart the window -- it still confirms", async () => {
+			// Regression for the "stuck on pending while all green" bug: GitHub's list endpoints are
+			// eventually consistent, so a build that has already been seen green can drop out of a later
+			// re-aggregation, shrinking the roster. That is NOT a new straggler and must not reset the
+			// settle clock (doing so kept all-builds pending for ~90s with everything green on
+			// wow-look-at-my/ai-shadertoy#4).
+			const cache = (env as unknown as { TOKEN_CACHE: KVNamespace }).TOKEN_CACHE;
+			await cache.put(
+				"installation-token:12345",
+				JSON.stringify({ token: "cached-token", expiresAt: Math.floor(Date.now() / 1000) + 3600 }),
+			);
+
+			const bodies: string[] = [];
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: "/repos/o/r/statuses/gs-shrink", method: "POST" })
+				.reply((opts) => {
+					bodies.push(String(opts.body));
+					return { statusCode: 201, data: { id: 1 } };
+				})
+				.times(2);
+			// Re-aggregation now finds only ONE of the two builds the window remembered -- "test" flapped
+			// out of the eventually-consistent listing. No NEW identity appeared, so the green is still
+			// trustworthy and the elapsed window must confirm.
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /^\/repos\/o\/r\/statuses\/gs-shrink\?/, method: "GET" })
+				.reply(200, []);
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /^\/repos\/o\/r\/commits\/gs-shrink\/check-runs/, method: "GET" })
+				.reply(200, { check_runs: [{ name: "build", status: "completed", conclusion: "success" }] });
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /^\/repos\/o\/r\/actions\/runs/, method: "GET" })
+				.reply(200, { workflow_runs: [] });
+
+			const namespace = ns();
+			await publishViaCoordinator(
+				namespace, "token", "o", "r", "gs-shrink", "all-builds",
+				{ state: "success", description: "2/2 builds passed", targetUrl }, 99999, 12345, [],
+				["check:build", "check:test"],
+			);
+
+			const stub = namespace.get(namespace.idFromName("o/r@gs-shrink"));
+			// Backdate the window past its deadline; the remembered roster is the original two builds.
+			await runInDurableObject(stub, (_i, state) =>
+				state.storage.put("greenSettle", { since: Date.now() - 60_000, roster: ["check:build", "check:test"] }),
+			);
+
+			expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+			// Leading edge held pending; the alarm CONFIRMED success despite the shrunk roster.
+			expect(JSON.parse(bodies[0]).state).toBe("pending");
+			expect(JSON.parse(bodies[1]).state).toBe("success");
+			// Confirmed -> window closed, reconcile cleared.
+			expect(await runInDurableObject(stub, (_i, state) => state.storage.get("greenSettle"))).toBeUndefined();
+			expect(await runInDurableObject(stub, (_i, state) => state.storage.get("reconcile"))).toBeUndefined();
+		});
+
+		it("a build flapping back in (already seen) does not restart the window", async () => {
+			// The remembered roster is a high-water union, so a build that dropped out and REAPPEARS is not
+			// a new straggler. Here the window already knows {build,test}; re-aggregation shows both again
+			// -- nothing new -> confirm, don't restart.
+			const cache = (env as unknown as { TOKEN_CACHE: KVNamespace }).TOKEN_CACHE;
+			await cache.put(
+				"installation-token:12345",
+				JSON.stringify({ token: "cached-token", expiresAt: Math.floor(Date.now() / 1000) + 3600 }),
+			);
+
+			const bodies: string[] = [];
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: "/repos/o/r/statuses/gs-flap", method: "POST" })
+				.reply((opts) => {
+					bodies.push(String(opts.body));
+					return { statusCode: 201, data: { id: 1 } };
+				})
+				.times(2);
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /^\/repos\/o\/r\/statuses\/gs-flap\?/, method: "GET" })
+				.reply(200, []);
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /^\/repos\/o\/r\/commits\/gs-flap\/check-runs/, method: "GET" })
+				.reply(200, {
+					check_runs: [
+						{ name: "build", status: "completed", conclusion: "success" },
+						{ name: "test", status: "completed", conclusion: "success" },
+					],
+				});
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /^\/repos\/o\/r\/actions\/runs/, method: "GET" })
+				.reply(200, { workflow_runs: [] });
+
+			const namespace = ns();
+			await publishViaCoordinator(
+				namespace, "token", "o", "r", "gs-flap", "all-builds",
+				{ state: "success", description: "2/2 builds passed", targetUrl }, 99999, 12345, [],
+				["check:build", "check:test"],
+			);
+
+			const stub = namespace.get(namespace.idFromName("o/r@gs-flap"));
+			// The union already covers both builds; backdate past the deadline.
+			await runInDurableObject(stub, (_i, state) =>
+				state.storage.put("greenSettle", { since: Date.now() - 60_000, roster: ["check:build", "check:test"] }),
+			);
+
+			expect(await runDurableObjectAlarm(stub)).toBe(true);
+			expect(JSON.parse(bodies[1]).state).toBe("success");
+			expect(await runInDurableObject(stub, (_i, state) => state.storage.get("greenSettle"))).toBeUndefined();
+		});
+
 		it("failure and pending publish immediately and open no settle window", async () => {
 			let fbody: string | undefined;
 			let pbody: string | undefined;
