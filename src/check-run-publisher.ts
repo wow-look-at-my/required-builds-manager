@@ -64,15 +64,18 @@ interface PendingPublish {
 }
 
 // An open green-settle window: we have seen the aggregate go `success`, but are holding it as `pending`
-// until it stays green, with an unchanged roster, for the full window (see applyGreenSettle). Persisted
-// in DO storage only while a green is awaiting confirmation; deleted the moment the aggregate is no
-// longer green or the green is confirmed.
+// until it stays green, with no NEW build registering, for the full window (see applyGreenSettle).
+// Persisted in DO storage only while a green is awaiting confirmation; deleted the moment the aggregate
+// is no longer green or the green is confirmed.
 interface GreenSettle {
-	// When the current stable-green window started. NOT reset by repeat green events for the same
-	// roster, so it measures real wall-clock since the first green -- only a roster change restarts it.
+	// When the current stable-green window started. NOT reset by repeat green events, so it measures real
+	// wall-clock since the first green -- only a brand-new build identity appearing restarts it.
 	since: number;
-	// The sorted roster of build identities ("kind:name") observed when the window (re)started. A later
-	// re-aggregation showing a different/larger roster means a new build registered -> restart the clock.
+	// The sorted UNION of every build identity ("kind:name") seen green since the window opened. It is a
+	// high-water mark, never shrunk: GitHub's list endpoints are eventually consistent, so a build can
+	// flap out of one re-aggregation and back into the next. Only an identity NOT already in this set is a
+	// genuine straggler that restarts the clock; a roster that merely shrank (a known build dropping out
+	// transiently) does not, so list-lag flapping can't wedge the window open forever.
 	roster: string[];
 }
 
@@ -118,13 +121,6 @@ function backoffMs(attempts: number): number {
 function greenSettleMs(env: PublisherEnv): number {
 	const n = env.GREEN_SETTLE_MS ? parseInt(env.GREEN_SETTLE_MS, 10) : NaN;
 	return Number.isFinite(n) && n >= 0 ? n : DEFAULT_GREEN_SETTLE_MS;
-}
-
-// Equality of two ALREADY-SORTED roster arrays.
-function keysEqual(a: string[], b: string[]): boolean {
-	if (a.length !== b.length) return false;
-	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-	return true;
 }
 
 // Durable Object that serializes commit-status publishing per commit AND self-heals stuck results.
@@ -281,11 +277,18 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 	// can clear the reconcile alarm), and -- when holding green -- the absolute time to re-check.
 	//
 	// failure / pending / error pass through unchanged and clear any open window (failure/error are
-	// terminal; pending is not). A `success` is HELD: we publish `pending` in its place and (re)open the
-	// window, UNLESS the aggregate has already been green with this exact roster for the full window --
-	// then the green is confirmed and `success` passes through as terminal. A roster that GREW while we
-	// waited (a new build registered) restarts the clock: more builds may still be coming, which is
-	// precisely the transient-green race we are guarding against.
+	// terminal; pending is not). A `success` is HELD: we publish `pending` in its place and open the
+	// window, UNLESS the aggregate has stayed green for the full window with no NEW build appearing --
+	// then the green is confirmed and `success` passes through as terminal.
+	//
+	// The restart trigger is a brand-new build IDENTITY, not any roster difference. A build that
+	// registers after we first read green is the transient-green race (more builds were still coming), so
+	// it restarts the clock. But GitHub's list endpoints are eventually consistent: a build that has
+	// already been seen can drop out of one re-aggregation and reappear in the next, shrinking then
+	// growing the roster with NO actual new build. The remembered roster is therefore a UNION (high-water
+	// mark) of everything seen green, and only an identity absent from it restarts the window -- so a
+	// shrink, or a known build flapping back in, never resets the clock and can't wedge the status on
+	// `pending` while every build is green.
 	private async applyGreenSettle(
 		update: StatusUpdate,
 		roster: string[],
@@ -300,20 +303,31 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 
 		const key = [...roster].sort();
 		const prev = await this.ctx.storage.get<GreenSettle>(GREEN_SETTLE_KEY);
-		const rosterUnchanged = prev != null && keysEqual(prev.roster, key);
 
-		if (prev != null && rosterUnchanged && now - prev.since >= settleMs) {
-			// Confirmed: stably green, no new build, for the whole window. Promote to success.
+		// A build identity we hadn't seen green before -> a straggler registered after we read green, the
+		// precise transient-green race. (prev == null is the first green, handled as a window open below,
+		// not a restart.)
+		const newBuildAppeared = prev != null && key.some((id) => !prev.roster.includes(id));
+		// The window's start: `now` for the first green or a genuine new straggler (restart the clock),
+		// otherwise the original start so wall-clock keeps accruing across flapping re-aggregations.
+		const since = prev == null || newBuildAppeared ? now : prev.since;
+		// High-water union of identities seen green -- never shrunk, so a flapping build isn't re-counted
+		// as "new" on its next reappearance.
+		const roster_ = prev == null ? key : [...new Set([...prev.roster, ...key])].sort();
+
+		if (prev != null && !newBuildAppeared && now - since >= settleMs) {
+			// Confirmed: stably green, no new build, for the whole window. Promote to success. (Requires a
+			// prior observation -- prev != null -- so the leading edge never publishes success directly.)
 			await this.ctx.storage.delete(GREEN_SETTLE_KEY);
 			return { update, terminal: true, armAt: null };
 		}
 
-		// Open the window (first green) or extend it (roster grew -> restart the clock). Publish pending
-		// in place of the premature green and re-check at the (possibly new) deadline. We keep the
-		// success description ("N/N builds passed"): with the pending state it reads as "all registered
-		// builds passed, finalizing", and the pending STATE is the load-bearing signal for the merge gate.
-		const since = rosterUnchanged ? prev!.since : now;
-		await this.ctx.storage.put<GreenSettle>(GREEN_SETTLE_KEY, { since, roster: key });
+		// Open the window (first green), restart it (new straggler), or keep holding (still within the
+		// window, or a harmless shrink/flap). Publish pending in place of the premature green and re-check
+		// at the deadline. We keep the success description ("N/N builds passed"): with the pending state it
+		// reads as "all registered builds passed, finalizing", and the pending STATE is the load-bearing
+		// signal for the merge gate.
+		await this.ctx.storage.put<GreenSettle>(GREEN_SETTLE_KEY, { since, roster: roster_ });
 		return {
 			update: { state: "pending", description: update.description, targetUrl: update.targetUrl },
 			terminal: false,

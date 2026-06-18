@@ -87,7 +87,7 @@ Optional, non-secret variables (set as plain Worker vars):
 
 | Variable | Default | Description |
 |---|---|---|
-| `GREEN_SETTLE_MS` | `45000` | How long (ms) a computed `success` must stay green, with an unchanged set of builds, before it is published. Guards against a transient green being consumed by auto-merge (see [Holding a transient green](#holding-a-transient-green-auto-merge-safety)). Only the `success` transition is delayed; `failure`/`pending` always publish immediately. |
+| `GREEN_SETTLE_MS` | `45000` | How long (ms) a computed `success` must stay green, with no new build registering, before it is published. Guards against a transient green being consumed by auto-merge (see [Holding a transient green](#holding-a-transient-green-auto-merge-safety)). Only the `success` transition is delayed; `failure`/`pending` always publish immediately. |
 
 Point your GitHub App's webhook URL to your deployed Worker.
 
