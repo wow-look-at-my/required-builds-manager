@@ -95,6 +95,20 @@ interface WorkflowRunEvent {
 	};
 }
 
+interface PullRequestEvent {
+	action: string;
+	pull_request: {
+		head: { sha: string };
+	};
+	repository: {
+		full_name: string;
+		private: boolean;
+	};
+	installation?: {
+		id: number;
+	};
+}
+
 function mapCheckRunState(status: string, conclusion: string | null): string {
 	if (status === "queued" || status === "in_progress") return "pending";
 	if (status !== "completed") return "pending";
@@ -159,7 +173,7 @@ export default {
 		}
 
 		const event = request.headers.get("x-github-event");
-		if (event !== "status" && event !== "check_run" && event !== "workflow_run") {
+		if (event !== "status" && event !== "check_run" && event !== "workflow_run" && event !== "pull_request") {
 			return new Response("Ignored event", { status: 200 });
 		}
 
@@ -186,6 +200,9 @@ export default {
 		let installationId: number | undefined;
 		let incomingAppId: number | undefined;
 		let isPrivate = false;
+		// Whether to force a PR merge-gate re-check (set for pull_request events so a freshly opened or
+		// synchronized PR is reconciled even when the all-builds state itself didn't change).
+		let force = false;
 		const incoming: IncomingDetail = {};
 
 		if (event === "status") {
@@ -211,7 +228,7 @@ export default {
 			incoming.kind = "check";
 			incoming.detail = payload.check_run.output?.title ?? undefined;
 			incoming.url = payload.check_run.details_url ?? payload.check_run.html_url ?? undefined;
-		} else {
+		} else if (event === "workflow_run") {
 			const payload: WorkflowRunEvent = JSON.parse(body);
 			sha = payload.workflow_run.head_sha;
 			incomingState = mapWorkflowRunState(payload.workflow_run.status, payload.workflow_run.conclusion);
@@ -222,6 +239,31 @@ export default {
 			incoming.kind = "workflow";
 			incoming.detail = payload.workflow_run.conclusion ?? undefined;
 			incoming.url = payload.workflow_run.html_url ?? undefined;
+		} else {
+			// pull_request event: gate THIS PR's merge on all-builds. There is no build to fold in -- we
+			// re-aggregate the head commit and route through the same publish path, whose doPublish
+			// reconciles the PR's draft state (force = true so a freshly opened/synchronized PR is always
+			// re-checked, even when all-builds itself is unchanged).
+			const payload: PullRequestEvent = JSON.parse(body);
+			const action = payload.action;
+			// Only the actions that change what should be gated; ignore label/assign/review/closed/etc.
+			if (
+				action !== "opened" &&
+				action !== "reopened" &&
+				action !== "synchronize" &&
+				action !== "ready_for_review"
+			) {
+				return new Response("Ignored pull_request action", { status: 200 });
+			}
+			sha = payload.pull_request.head.sha;
+			// Leave incoming.kind unset so nothing is folded in / measured; "pending" is dropped by
+			// aggregation anyway.
+			incomingState = "pending";
+			incomingContext = "";
+			fullName = payload.repository.full_name;
+			isPrivate = payload.repository.private;
+			installationId = payload.installation?.id;
+			force = true;
 		}
 
 		if (!installationId) {
@@ -331,6 +373,7 @@ export default {
 				config.ignore,
 				roster,
 				measure,
+				force,
 			);
 
 		try {
