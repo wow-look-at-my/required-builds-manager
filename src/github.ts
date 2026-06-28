@@ -222,3 +222,74 @@ export async function publishStatus(
 		throw err;
 	}
 }
+
+export interface PullRef {
+	number: number;
+	nodeId: string;
+	draft: boolean;
+}
+
+// Lists OPEN pull requests whose HEAD commit is exactly `sha`. Used by the PR merge-gate to find which
+// PRs to draft/ready as all-builds moves. The /commits/{sha}/pulls endpoint returns PRs associated with
+// a commit; we keep only OPEN ones whose head is this sha (so we never touch a PR that merely contains
+// the commit deeper in its history). Best-effort: a 404/422 (no association) degrades to []. Requires
+// `pull requests: read`.
+export async function listOpenPullRequestsForSha(
+	token: string,
+	owner: string,
+	repo: string,
+	sha: string,
+): Promise<PullRef[]> {
+	const url = `${GITHUB_API}/repos/${owner}/${repo}/commits/${sha}/pulls?per_page=100`;
+	const res = await fetchWithRetry(url, {
+		headers: {
+			Authorization: `token ${token}`,
+			Accept: "application/vnd.github+json",
+			"User-Agent": "required-builds-manager",
+		},
+	});
+	if (!res.ok) {
+		if (res.status === 404 || res.status === 422) return [];
+		const err = new Error(`GitHub API error listing PRs: ${res.status} ${res.statusText}`) as Error & {
+			status?: number;
+		};
+		err.status = res.status;
+		throw err;
+	}
+	const data: Array<{ number: number; node_id: string; draft?: boolean; state: string; head?: { sha?: string } }> =
+		await res.json();
+	return data
+		.filter((p) => p.state === "open" && p.head?.sha === sha)
+		.map((p) => ({ number: p.number, nodeId: p.node_id, draft: !!p.draft }));
+}
+
+// Flips a pull request's draft state via GraphQL (REST can't toggle draft). This IS the merge gate: a
+// draft PR cannot be merged, so drafting holds the merge until all-builds is green and marking it ready
+// releases it -- all WITHOUT a required status check, so direct pushes are never affected. Attaches the
+// HTTP status on failure so the caller can do the same stale-token 403 refresh as the status path.
+// Requires `pull requests: write`.
+export async function setPullRequestDraft(token: string, prNodeId: string, draft: boolean): Promise<void> {
+	const mutation = draft
+		? "mutation($id:ID!){convertPullRequestToDraft(input:{pullRequestId:$id}){clientMutationId}}"
+		: "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){clientMutationId}}";
+	const res = await fetchWithRetry(`${GITHUB_API}/graphql`, {
+		method: "POST",
+		headers: {
+			Authorization: `bearer ${token}`,
+			"User-Agent": "required-builds-manager",
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({ query: mutation, variables: { id: prNodeId } }),
+	});
+	if (!res.ok) {
+		const err = new Error(`GitHub API error toggling PR draft: ${res.status} ${res.statusText}`) as Error & {
+			status?: number;
+		};
+		err.status = res.status;
+		throw err;
+	}
+	const body = (await res.json()) as { errors?: unknown };
+	if (body.errors) {
+		throw new Error(`GraphQL error toggling PR draft: ${JSON.stringify(body.errors)}`);
+	}
+}
