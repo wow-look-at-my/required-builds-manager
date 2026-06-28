@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { publishStatus, type StatusUpdate } from "./github";
+import { publishStatus, listOpenPullRequestsForSha, setPullRequestDraft, type StatusUpdate } from "./github";
 import { computeAllBuildsState } from "./aggregate";
 import { getInstallationToken } from "./auth";
 import { applyIncoming, compare, type IncomingBuild, type PredBuild, type SimpleState } from "./predict";
@@ -61,6 +61,9 @@ interface PendingPublish {
 	// The roster of build identities ("kind:name") backing `update`, so the trailing flush can feed the
 	// green-settle window the same "did a new build appear?" signal a leading-edge publish would.
 	roster: string[];
+	// Whether this publish should force a PR merge-gate re-check (a pull_request event bypasses the gate
+	// caches). Preserved across coalescing so a deferred PR event still reconciles its PR on flush.
+	force: boolean;
 }
 
 // An open green-settle window: we have seen the aggregate go `success`, but are holding it as `pending`
@@ -107,6 +110,13 @@ const RECONCILE_MAX_ATTEMPTS = 12;
 
 // DO storage key for the open green-settle window (see GreenSettle / applyGreenSettle).
 const GREEN_SETTLE_KEY = "greenSettle";
+// PR merge-gate (Option B) storage. PR_GATE_KEY: the last gate state we applied for this commit
+// ({desired, hasPrs}) -- a build event only hits the PR-list / draft APIs once we know the commit is a
+// PR head (hasPrs) or a pull_request event forces a re-check, and only on an actual gate transition.
+// DRAFTED_PRS_KEY: the PR numbers WE converted to draft, so we only ever mark-ready PRs we drafted --
+// never an author's own WIP draft. See maybeGatePrs.
+const PR_GATE_KEY = "prGate";
+const DRAFTED_PRS_KEY = "draftedPrs";
 // How long a computed `success` must stay green (with an unchanged roster) before we publish it. The
 // only state auto-merge can irreversibly consume is `success`, so we deliberately add latency ONLY to
 // the green transition -- failure/pending stay instant. 45s is long enough for stragglers (a build that
@@ -182,6 +192,7 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 		ignore: string[],
 		roster: string[] = [],
 		measure?: MeasurePayload,
+		force = false,
 	): Promise<void> {
 		await this.ctx.blockConcurrencyWhile(async () => {
 			if (measure) {
@@ -201,7 +212,7 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 				// Leading edge: the window is open, so publish immediately (keeps the merge gate
 				// responsive). Any queued trailing flush is superseded by this fresher publish.
 				await this.ctx.storage.delete(PENDING_PUBLISH_KEY);
-				await this.doPublish(token, owner, repo, sha, context, update, appId, installationId, ignore, roster);
+				await this.doPublish(token, owner, repo, sha, context, update, appId, installationId, ignore, roster, force);
 				// Mark the window only AFTER a successful publish, so a thrown publish (e.g. a 403 the
 				// handler retries with a fresh token) re-enters the leading edge instead of being deferred.
 				await this.ctx.storage.put<number>(LAST_FLUSH_AT_KEY, Date.now());
@@ -219,6 +230,7 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 					appId: appId ?? 0,
 					ignore,
 					roster,
+					force,
 				});
 				const flushAt = lastFlushAt + PUBLISH_DEBOUNCE_MS;
 				const existing = await this.ctx.storage.getAlarm();
@@ -246,6 +258,7 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 		installationId: number,
 		ignore: string[],
 		roster: string[],
+		force = false,
 	): Promise<void> {
 		const decided = await this.applyGreenSettle(update, roster, Date.now(), greenSettleMs(this.env));
 
@@ -265,6 +278,13 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 			decided.armAt ?? undefined,
 		);
 		await this.publishIfChanged(token, owner, repo, sha, context, decided.update);
+		// Reconcile PR draft state off the merge-gate signal (best-effort: must never break publishing).
+		// `update.state` is the raw aggregate state; decided.terminal marks a CONFIRMED (settled) green.
+		try {
+			await this.maybeGatePrs(token, owner, repo, sha, update.state, decided.terminal, force);
+		} catch {
+			// swallow -- PR gating is best-effort, never a reason to fail a status publish
+		}
 		if (decided.terminal) {
 			// Terminal landed -- stop reconciling. (If publishIfChanged threw, we never reach here and the
 			// armed alarm retries.)
@@ -358,6 +378,7 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 							pending.installationId,
 							pending.ignore,
 							pending.roster,
+							pending.force,
 						);
 					};
 					try {
@@ -413,6 +434,13 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 				// status every backoff interval. Safe because we only record after a successful POST, so an
 				// equal record means GitHub provably already has this status.
 				await this.publishIfChanged(token, s.owner, s.repo, s.sha, s.context, decided.update);
+				// The green-settle CONFIRMATION lands here (the alarm promotes a held green to success), so
+				// PRs are released to "ready" in this path too. Best-effort, same as the event path.
+				try {
+					await this.maybeGatePrs(token, s.owner, s.repo, s.sha, result.state, decided.terminal, false);
+				} catch {
+					// swallow -- PR gating is best-effort
+				}
 				return decided.terminal ? "resolved" : "pending";
 			};
 
@@ -494,6 +522,59 @@ export class CheckRunPublisher extends DurableObject<PublisherEnv> {
 		return true;
 	}
 
+	// Reconciles the draft state of every open PR whose head is this commit, so the merge button is
+	// gated on all-builds WITHOUT a required status check (which would also block pushes). Desired
+	// state: DRAFT while all-builds is failing/pending/error; READY once all-builds is CONFIRMED green
+	// (green-settle terminal success). A held (unconfirmed) green returns null -> leave PRs as-is, so a
+	// transient green never releases a merge and an already-released PR never flaps back. We only
+	// mark-ready PRs WE drafted (DRAFTED_PRS_KEY), so an author's own WIP draft is never force-readied.
+	// `force` (a pull_request event) bypasses the per-commit transition / no-PR caches so a freshly
+	// opened or synchronized PR is always reconciled.
+	private async maybeGatePrs(
+		token: string,
+		owner: string,
+		repo: string,
+		sha: string,
+		rawState: StatusUpdate["state"],
+		terminal: boolean,
+		force: boolean,
+	): Promise<void> {
+		const desired: "draft" | "ready" | null = rawState === "success" ? (terminal ? "ready" : null) : "draft";
+		if (desired === null) return; // unconfirmed green -- leave PRs untouched
+
+		const gate = await this.ctx.storage.get<{ desired: string; hasPrs: boolean }>(PR_GATE_KEY);
+		// Only touch PRs when a pull_request event forced this, or we already confirmed this commit is
+		// some PR's head. A plain build event on a commit with no known PR does nothing (and makes no API
+		// call) -- most commits aren't PR heads, and a PR always sends a pull_request event
+		// (opened/synchronize/...) that sets hasPrs before its build events matter.
+		if (!force && !(gate && gate.hasPrs)) return;
+		if (!force && gate && gate.desired === desired) return; // no gate transition since last reconcile
+
+		const prs = await listOpenPullRequestsForSha(token, owner, repo, sha);
+		if (prs.length === 0) {
+			await this.ctx.storage.put(PR_GATE_KEY, { desired, hasPrs: false });
+			return;
+		}
+
+		const drafted = new Set<number>((await this.ctx.storage.get<number[]>(DRAFTED_PRS_KEY)) ?? []);
+		for (const pr of prs) {
+			if (desired === "draft") {
+				// Convert only currently-ready PRs, and remember we did -- so we never later un-draft a PR
+				// the author themselves left as a draft.
+				if (!pr.draft) {
+					await setPullRequestDraft(token, pr.nodeId, true);
+					drafted.add(pr.number);
+				}
+			} else if (pr.draft && drafted.has(pr.number)) {
+				// Release only PRs we drafted.
+				await setPullRequestDraft(token, pr.nodeId, false);
+				drafted.delete(pr.number);
+			}
+		}
+		await this.ctx.storage.put<number[]>(DRAFTED_PRS_KEY, [...drafted]);
+		await this.ctx.storage.put(PR_GATE_KEY, { desired, hasPrs: true });
+	}
+
 	// Compares the event-only prediction against the authoritative list, records the outcome, then
 	// re-corrects the stored snapshot to reality. The store starts from the LAST list snapshot, so the
 	// prediction is "known-good snapshot + just this one event" -- the fairest test of events-alone.
@@ -561,8 +642,9 @@ export async function publishViaCoordinator(
 	ignore: string[],
 	roster: string[] = [],
 	measure?: MeasurePayload,
+	force = false,
 ): Promise<void> {
 	const id = namespace.idFromName(`${owner}/${repo}@${sha}`);
 	const stub = namespace.get(id);
-	await stub.publish(token, owner, repo, sha, context, update, appId, installationId, ignore, roster, measure);
+	await stub.publish(token, owner, repo, sha, context, update, appId, installationId, ignore, roster, measure, force);
 }

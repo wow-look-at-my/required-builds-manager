@@ -44,6 +44,12 @@ When a workflow's YAML is invalid (or it otherwise fails before any job runs), G
 
 This lets you use a single required check (`all-builds`) in your branch protection rules instead of listing every individual CI job.
 
+### Gating PR merges without blocking pushes
+
+Optionally, the worker can gate **pull-request merges** on `all-builds` *without* a required status check. Marking `all-builds` "required" in branch protection is loophole-proof, but a required status check is attached to the branch ref, so it also blocks direct `git push` of un-checked commits to that branch. To keep pushes free, the worker instead toggles a PR's **draft** state (a draft PR can't be merged): while the PR head's `all-builds` isn't settled-green it converts the PR to a draft, and once `all-builds` is confirmed green it marks the PR ready. Direct `git push` to any branch is completely unaffected.
+
+It only un-drafts PRs it drafted (so your own WIP drafts are left alone) and inherits the green-settle window, so a transient green never releases a merge. This is **best-effort, not loophole-proof** — a regression landing in the brief window between "green" and "re-drafted" could still be merged — so it suits trusted, non-adversarial repositories. To enable it, grant the App `Pull requests: write` and subscribe it to the `Pull request` webhook event; to disable it, omit them.
+
 ## Per-Repo Configuration
 
 Optionally create `.github/required-builds.yml` in a repository to customize behavior:
@@ -67,10 +73,10 @@ If no config file exists, the app uses `all-builds` as the context with no ignor
 ### Prerequisites
 
 - A [GitHub App](https://docs.github.com/en/apps/creating-github-apps) with:
-  - **Webhook events**: `Status`, `Check run`, `Workflow run`
-  - **Permissions**: `Commit statuses` (read & write), `Checks` (read), `Actions` (read), `Contents` (read)
+  - **Webhook events**: `Status`, `Check run`, `Workflow run`, and (for the PR merge-gate) `Pull request`
+  - **Permissions**: `Commit statuses` (read & write), `Pull requests` (read & write), `Checks` (read), `Actions` (read), `Contents` (read)
 
-  > **Note:** the worker publishes its combined result as a **commit status**, so it needs `Commit statuses: write`. It reads check runs and workflow runs (`Checks: read`, `Actions: read`) to aggregate them. (Earlier versions published a check run and needed `Checks: write`; that is no longer required.)
+  > **Note:** the worker publishes its combined result as a **commit status**, so it needs `Commit statuses: write`. It reads check runs and workflow runs (`Checks: read`, `Actions: read`) to aggregate them. (Earlier versions published a check run and needed `Checks: write`; that is no longer required.) The optional **PR merge-gate** (see "Gating PR merges without blocking pushes" above) flips pull requests between draft and ready, which needs `Pull requests: write` and the `Pull request` webhook event — omit both if you don't want it.
 - A [Cloudflare Workers](https://workers.cloudflare.com/) account
 
 ### Configuration

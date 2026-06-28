@@ -103,6 +103,19 @@ function makeGetRequest(path: string): Request {
 	return new Request(`https://worker.example.com${path}`, { method: "GET" });
 }
 
+function makePullRequestRequest(body: object, headers: Record<string, string> = {}): Request {
+	return new Request("https://worker.example.com/webhook", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"x-github-event": "pull_request",
+			"x-hub-signature-256": "sha256=abc123",
+			...headers,
+		},
+		body: JSON.stringify(body),
+	});
+}
+
 const statusPayload = {
 	state: "success",
 	context: "ci/tests",
@@ -131,6 +144,13 @@ const workflowRunPayload = {
 		conclusion: "startup_failure",
 		head_sha: "abc123def",
 	},
+	repository: { full_name: "myorg/myrepo", private: false },
+	installation: { id: 12345 },
+};
+
+const pullRequestPayload = {
+	action: "opened",
+	pull_request: { head: { sha: "abc123def" } },
 	repository: { full_name: "myorg/myrepo", private: false },
 	installation: { id: 12345 },
 };
@@ -250,6 +270,7 @@ describe("worker fetch handler", () => {
 			[],
 			expect.any(Array),
 			expect.objectContaining({ actualBuilds: expect.any(Array), actualState: expect.any(String) }),
+			false,
 		);
 		// The webhook path publishes state + title only; it must NOT pay for per-step enrichment.
 		expect(mockedEnrich).not.toHaveBeenCalled();
@@ -296,6 +317,7 @@ describe("worker fetch handler", () => {
 			[],
 			expect.any(Array),
 			expect.objectContaining({ actualBuilds: expect.any(Array), actualState: expect.any(String) }),
+			false,
 		);
 	});
 
@@ -320,6 +342,7 @@ describe("worker fetch handler", () => {
 			[],
 			expect.any(Array),
 			expect.objectContaining({ actualBuilds: expect.any(Array), actualState: expect.any(String) }),
+			false,
 		);
 	});
 
@@ -592,6 +615,7 @@ describe("worker fetch handler", () => {
 			[],
 			expect.any(Array),
 			expect.objectContaining({ actualBuilds: expect.any(Array), actualState: expect.any(String) }),
+			false,
 		);
 	});
 
@@ -646,6 +670,41 @@ describe("worker fetch handler", () => {
 
 		expect(res.status).toBe(400);
 		expect(await res.text()).toBe("Missing installation ID in webhook payload");
+	});
+
+	// pull_request event tests (the PR merge-gate entry point)
+
+	it("routes a pull_request event through the publish path with force = true", async () => {
+		const res = await worker.fetch(makePullRequestRequest(pullRequestPayload), env as any);
+
+		expect(res.status).toBe(200);
+		// Re-aggregates the PR head; nothing is folded in (incomingState "pending", empty context).
+		expect(mockedCompute).toHaveBeenCalledWith(
+			"test-installation-token",
+			"myorg",
+			"myrepo",
+			"abc123def",
+			"pending",
+			"",
+			12345,
+			defaultConfig,
+			expect.anything(),
+		);
+		// The final argument to publishViaCoordinator is force = true (so a freshly opened PR is gated).
+		const lastCall = mockedPublishViaCoordinator.mock.calls.at(-1)!;
+		expect(lastCall.at(-1)).toBe(true);
+	});
+
+	it("ignores irrelevant pull_request actions without aggregating", async () => {
+		const res = await worker.fetch(
+			makePullRequestRequest({ ...pullRequestPayload, action: "labeled" }),
+			env as any,
+		);
+
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe("Ignored pull_request action");
+		expect(mockedCompute).not.toHaveBeenCalled();
+		expect(mockedPublishViaCoordinator).not.toHaveBeenCalled();
 	});
 
 	// Breakdown page (GET /b/{owner}/{repo}/{sha}?k=<sig>) -- the commit status's "Details" link.

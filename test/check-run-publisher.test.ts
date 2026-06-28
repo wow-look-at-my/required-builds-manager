@@ -591,4 +591,50 @@ describe("publishViaCoordinator (Durable Object)", () => {
 			expect(await runInDurableObject(pstub, (_i, state) => state.storage.get("greenSettle"))).toBeUndefined();
 		});
 	});
+
+	// PR merge-gate (Option B): drafts/releases PRs based on the CONFIRMED all-builds state, with no
+	// required status check (so direct pushes are unaffected). The gate only engages when forced (a
+	// pull_request event) or after a PR has been seen for the commit.
+	describe("PR merge-gate (draft toggling)", () => {
+		it("drafts an open PR when a forced (pull_request) publish sees a non-green aggregate", async () => {
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: "/repos/o/r/statuses/pr-sha-1", method: "POST" })
+				.reply(201, { id: 1 });
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: /\/repos\/o\/r\/commits\/pr-sha-1\/pulls/, method: "GET" })
+				.reply(200, [{ number: 10, node_id: "PR_10", draft: false, state: "open", head: { sha: "pr-sha-1" } }]);
+			let gql: string | undefined;
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: "/graphql", method: "POST" })
+				.reply((opts) => {
+					gql = String(opts.body);
+					return { statusCode: 200, data: { data: {} } };
+				});
+
+			await publishViaCoordinator(
+				ns(), "token", "o", "r", "pr-sha-1", "all-builds",
+				{ state: "failure", description: "1/2 builds failed", targetUrl }, 99999, 12345, [], [], undefined, true,
+			);
+
+			expect(JSON.parse(gql!).query).toContain("convertPullRequestToDraft");
+			expect(JSON.parse(gql!).variables).toEqual({ id: "PR_10" });
+		});
+
+		it("leaves PRs untouched on a held (unconfirmed) green, even when forced", async () => {
+			// Only the status POST is intercepted. If the gate tried to list PRs or toggle a draft on this
+			// (held, not-yet-confirmed) green, disableNetConnect would throw on the un-mocked request.
+			fetchMock
+				.get("https://api.github.com")
+				.intercept({ path: "/repos/o/r/statuses/pr-sha-2", method: "POST" })
+				.reply(201, { id: 2 });
+
+			await publishViaCoordinator(
+				ns(), "token", "o", "r", "pr-sha-2", "all-builds",
+				{ state: "success", description: "2/2 builds passed", targetUrl }, 99999, 12345, [], [], undefined, true,
+			);
+		});
+	});
 });
