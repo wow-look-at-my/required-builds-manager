@@ -2,13 +2,57 @@ export interface CommitStatus {
 	state: string;
 	context: string;
 	id: number;
+	description?: string | null;
+	target_url?: string | null;
 }
 
 export interface CheckRun {
 	name: string;
 	status: string;
 	conclusion: string | null;
+	app?: { id: number };
+	output?: { title: string | null; summary: string | null };
+	details_url?: string | null;
+	html_url?: string | null;
+	started_at?: string | null;
+	completed_at?: string | null;
 }
+
+export interface WorkflowRun {
+	name: string | null;
+	status: string;
+	conclusion: string | null;
+	head_sha: string;
+	html_url?: string | null;
+	run_started_at?: string | null;
+	updated_at?: string | null;
+}
+
+export interface JobStep {
+	name: string;
+	// queued | in_progress | completed
+	status: string;
+	// success | failure | skipped | cancelled | neutral | null (while not completed)
+	conclusion: string | null;
+	number: number;
+}
+
+export interface WorkflowJob {
+	steps?: JobStep[];
+}
+
+export interface StatusUpdate {
+	// Commit-status states map 1:1 to the aggregate's states. Unlike a completed check run, a status
+	// can move freely between these on every event (GitHub keeps the latest per context).
+	state: "success" | "pending" | "failure" | "error";
+	// Short headline (GitHub caps the status description at ~140 chars). The full per-build breakdown
+	// lives behind targetUrl.
+	description: string;
+	// The capability URL for the self-hosted breakdown page (the status's "Details" link).
+	targetUrl: string;
+}
+
+import { fetchWithRetry } from "./fetch-retry";
 
 const GITHUB_API = "https://api.github.com";
 
@@ -23,7 +67,7 @@ export async function listStatuses(
 
 	for (;;) {
 		const url = `${GITHUB_API}/repos/${owner}/${repo}/statuses/${sha}?per_page=100&page=${page}`;
-		const res = await fetch(url, {
+		const res = await fetchWithRetry(url, {
 			headers: {
 				Authorization: `token ${token}`,
 				Accept: "application/vnd.github+json",
@@ -57,7 +101,7 @@ export async function listCheckRuns(
 
 	for (;;) {
 		const url = `${GITHUB_API}/repos/${owner}/${repo}/commits/${sha}/check-runs?per_page=100&page=${page}`;
-		const res = await fetch(url, {
+		const res = await fetchWithRetry(url, {
 			headers: {
 				Authorization: `token ${token}`,
 				Accept: "application/vnd.github+json",
@@ -80,17 +124,78 @@ export async function listCheckRuns(
 	return all;
 }
 
-export async function createStatus(
+export async function listWorkflowRuns(
 	token: string,
 	owner: string,
 	repo: string,
 	sha: string,
-	state: string,
+): Promise<WorkflowRun[]> {
+	const all: WorkflowRun[] = [];
+	let page = 1;
+
+	for (;;) {
+		const url = `${GITHUB_API}/repos/${owner}/${repo}/actions/runs?head_sha=${sha}&per_page=100&page=${page}`;
+		const res = await fetchWithRetry(url, {
+			headers: {
+				Authorization: `token ${token}`,
+				Accept: "application/vnd.github+json",
+				"User-Agent": "required-builds-manager",
+			},
+		});
+
+		if (!res.ok) {
+			throw new Error(`GitHub API error: ${res.status} ${res.statusText}`);
+		}
+
+		const data: { workflow_runs: WorkflowRun[] } = await res.json();
+		if (data.workflow_runs.length === 0) break;
+
+		all.push(...data.workflow_runs);
+		if (data.workflow_runs.length < 100) break;
+		page++;
+	}
+
+	return all;
+}
+
+// Fetches a single Actions job (by id) to read its individual steps. Used to show, for a failed or
+// in-progress check run, exactly which step failed or is running. Best-effort: returns null on any
+// error (e.g. the app lacks `actions:read`, or the check run isn't an Actions job) so the caller can
+// simply omit step detail. Requires the `actions:read` permission.
+export async function getWorkflowJob(
+	token: string,
+	owner: string,
+	repo: string,
+	jobId: number,
+): Promise<WorkflowJob | null> {
+	const url = `${GITHUB_API}/repos/${owner}/${repo}/actions/jobs/${jobId}`;
+	const res = await fetchWithRetry(url, {
+		headers: {
+			Authorization: `token ${token}`,
+			Accept: "application/vnd.github+json",
+			"User-Agent": "required-builds-manager",
+		},
+	});
+
+	if (!res.ok) return null;
+
+	return (await res.json()) as WorkflowJob;
+}
+
+// Publishes the combined result as a COMMIT STATUS (not a check run). GitHub keeps the latest status
+// per context and lets it move freely between states on every event, so all-builds can return to
+// pending/failure after a success when a new build appears for the same SHA -- something a completed
+// check run cannot do (GitHub freezes a completed check run's conclusion). The rich per-build breakdown
+// is served separately from our own /b/ route and linked via target_url. Requires `statuses: write`.
+export async function publishStatus(
+	token: string,
+	owner: string,
+	repo: string,
+	sha: string,
 	context: string,
-	description: string,
+	update: StatusUpdate,
 ): Promise<void> {
-	const url = `${GITHUB_API}/repos/${owner}/${repo}/statuses/${sha}`;
-	const res = await fetch(url, {
+	const res = await fetchWithRetry(`${GITHUB_API}/repos/${owner}/${repo}/statuses/${sha}`, {
 		method: "POST",
 		headers: {
 			Authorization: `token ${token}`,
@@ -98,10 +203,93 @@ export async function createStatus(
 			"User-Agent": "required-builds-manager",
 			"Content-Type": "application/json",
 		},
-		body: JSON.stringify({ state, context, description }),
+		body: JSON.stringify({
+			state: update.state,
+			context,
+			// GitHub caps the status description at ~140 chars.
+			description: update.description.slice(0, 140),
+			target_url: update.targetUrl,
+		}),
 	});
 
 	if (!res.ok) {
-		throw new Error(`GitHub API error creating status: ${res.status} ${res.statusText}`);
+		// Attach the HTTP status so callers can distinguish a stale-token 403 (retry with a fresh
+		// token) from other failures -- the same recovery the check-run path used.
+		const err = new Error(`GitHub API error publishing status: ${res.status} ${res.statusText}`) as Error & {
+			status?: number;
+		};
+		err.status = res.status;
+		throw err;
+	}
+}
+
+export interface PullRef {
+	number: number;
+	nodeId: string;
+	draft: boolean;
+}
+
+// Lists OPEN pull requests whose HEAD commit is exactly `sha`. Used by the PR merge-gate to find which
+// PRs to draft/ready as all-builds moves. The /commits/{sha}/pulls endpoint returns PRs associated with
+// a commit; we keep only OPEN ones whose head is this sha (so we never touch a PR that merely contains
+// the commit deeper in its history). Best-effort: a 404/422 (no association) degrades to []. Requires
+// `pull requests: read`.
+export async function listOpenPullRequestsForSha(
+	token: string,
+	owner: string,
+	repo: string,
+	sha: string,
+): Promise<PullRef[]> {
+	const url = `${GITHUB_API}/repos/${owner}/${repo}/commits/${sha}/pulls?per_page=100`;
+	const res = await fetchWithRetry(url, {
+		headers: {
+			Authorization: `token ${token}`,
+			Accept: "application/vnd.github+json",
+			"User-Agent": "required-builds-manager",
+		},
+	});
+	if (!res.ok) {
+		if (res.status === 404 || res.status === 422) return [];
+		const err = new Error(`GitHub API error listing PRs: ${res.status} ${res.statusText}`) as Error & {
+			status?: number;
+		};
+		err.status = res.status;
+		throw err;
+	}
+	const data: Array<{ number: number; node_id: string; draft?: boolean; state: string; head?: { sha?: string } }> =
+		await res.json();
+	return data
+		.filter((p) => p.state === "open" && p.head?.sha === sha)
+		.map((p) => ({ number: p.number, nodeId: p.node_id, draft: !!p.draft }));
+}
+
+// Flips a pull request's draft state via GraphQL (REST can't toggle draft). This IS the merge gate: a
+// draft PR cannot be merged, so drafting holds the merge until all-builds is green and marking it ready
+// releases it -- all WITHOUT a required status check, so direct pushes are never affected. Attaches the
+// HTTP status on failure so the caller can do the same stale-token 403 refresh as the status path.
+// Requires `pull requests: write`.
+export async function setPullRequestDraft(token: string, prNodeId: string, draft: boolean): Promise<void> {
+	const mutation = draft
+		? "mutation($id:ID!){convertPullRequestToDraft(input:{pullRequestId:$id}){clientMutationId}}"
+		: "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){clientMutationId}}";
+	const res = await fetchWithRetry(`${GITHUB_API}/graphql`, {
+		method: "POST",
+		headers: {
+			Authorization: `bearer ${token}`,
+			"User-Agent": "required-builds-manager",
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({ query: mutation, variables: { id: prNodeId } }),
+	});
+	if (!res.ok) {
+		const err = new Error(`GitHub API error toggling PR draft: ${res.status} ${res.statusText}`) as Error & {
+			status?: number;
+		};
+		err.status = res.status;
+		throw err;
+	}
+	const body = (await res.json()) as { errors?: unknown };
+	if (body.errors) {
+		throw new Error(`GraphQL error toggling PR draft: ${JSON.stringify(body.errors)}`);
 	}
 }
